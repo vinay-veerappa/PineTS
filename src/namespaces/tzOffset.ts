@@ -92,22 +92,76 @@ export function rawTimezoneOffsetMs(timezone: string, utcMs: number): number {
 }
 
 /**
- * Offset at each UTC-midnight boundary, keyed `${timezone}|${dayIndex}`.
- * Bounded so a long backtest sweeping many symbols cannot grow it without
- * limit; a clear costs one re-probe per day touched afterwards.
+ * Offset at each UTC-midnight boundary: one INTEGER-keyed map per timezone.
+ *
+ * It used to be a single map keyed `${timezone}|${dayIndex}`, and that key
+ * was the cost. The cache hit essentially every time, yet a profiled 10k-bar
+ * HTF_EMA execute still spent 8.9% of self time here and none of it in
+ * `formatToParts` — it was allocating a string and hashing it, twice per
+ * {@link timezoneOffsetMs} call, at ~5k calls per bar. Splitting by timezone
+ * makes the inner key a plain integer: no allocation, cheap hash.
+ *
+ * The bound is now PER TIMEZONE rather than global. A script uses one or two
+ * zones, so the ceiling is unchanged in practice, and a clear still costs one
+ * re-probe per day touched afterwards.
  */
-const boundaryCache = new Map<string, number>();
+const boundaryCaches = new Map<string, Map<number, number>>();
 const BOUNDARY_CACHE_MAX = 8192;
 
-function boundaryOffset(timezone: string, dayIndex: number): number {
-    const key = `${timezone}|${dayIndex}`;
-    const hit = boundaryCache.get(key);
+/** The day map for a timezone, with the last one resolved held in a scalar —
+ *  consecutive calls are the same zone in every real script. */
+let daysTz = '';
+let daysMap: Map<number, number> | null = null;
+
+function daysFor(timezone: string): Map<number, number> {
+    if (daysMap !== null && timezone === daysTz) return daysMap;
+    let m = boundaryCaches.get(timezone);
+    if (m === undefined) {
+        m = new Map<number, number>();
+        boundaryCaches.set(timezone, m);
+    }
+    daysTz = timezone;
+    daysMap = m;
+    return m;
+}
+
+function boundaryOffsetIn(days: Map<number, number>, timezone: string, dayIndex: number): number {
+    const hit = days.get(dayIndex);
     if (hit !== undefined) return hit;
     const off = rawTimezoneOffsetMs(timezone, dayIndex * DAY_MS);
-    if (boundaryCache.size >= BOUNDARY_CACHE_MAX) boundaryCache.clear();
-    boundaryCache.set(key, off);
+    if (days.size >= BOUNDARY_CACHE_MAX) days.clear();
+    days.set(dayIndex, off);
     return off;
 }
+
+/**
+ * The answer for the LAST UTC day resolved, held in scalars.
+ *
+ * WHY, on top of {@link boundaryCache}. The Map cache already HITS on
+ * essentially every call — a profile of a 10k-bar HTF_EMA execute still put
+ * 8.9% of self time in {@link boundaryOffset}, and none of it was
+ * `formatToParts`. The cost was reaching the hit: building a
+ * `${timezone}|${dayIndex}` key allocates a string and hashes it, and
+ * {@link timezoneOffsetMs} does that TWICE per call (start and end
+ * boundary) at ~5k calls per bar. A scalar compare skips both probes.
+ *
+ * Bars march forward in time, so a chart's own per-bar time calls repeat the
+ * same (timezone, dayIndex) and this answers them outright. It is NOT enough
+ * on its own: `timestamp(tz, y, m, d, ...)` resolves an ARBITRARY calendar
+ * date, so a script computing month/week predicates per bar (first Friday,
+ * third Friday) makes the day index jump and thrashes a one-entry memo. That
+ * traffic is what {@link boundaryOffsetIn}'s integer key is for; the two
+ * layers cover the two access patterns.
+ *
+ * ONLY a constant day is memoized. On a transition day the offset varies
+ * WITHIN the day, so `memoConstant` stays false and every instant in it
+ * keeps taking the exact slow path — the memo cannot smear an offset across
+ * a transition, which is the invariant this file exists to hold.
+ */
+let memoTz = '';
+let memoDayIndex = NaN;
+let memoOffset = 0;
+let memoConstant = false;
 
 /**
  * UTC offset in milliseconds for `utcMs` in `timezone` (positive = east of
@@ -118,15 +172,32 @@ function boundaryOffset(timezone: string, dayIndex: number): number {
  */
 export function timezoneOffsetMs(timezone: string, utcMs: number): number {
     const dayIndex = Math.floor(utcMs / DAY_MS);
-    const startOff = boundaryOffset(timezone, dayIndex);
-    const endOff = boundaryOffset(timezone, dayIndex + 1);
+    if (memoConstant && dayIndex === memoDayIndex && timezone === memoTz) return memoOffset;
+    const days = daysFor(timezone);
+    const startOff = boundaryOffsetIn(days, timezone, dayIndex);
+    const endOff = boundaryOffsetIn(days, timezone, dayIndex + 1);
     // Boundaries agree => no transition inside this UTC day => constant.
-    if (startOff === endOff) return startOff;
+    if (startOff === endOff) {
+        memoTz = timezone;
+        memoDayIndex = dayIndex;
+        memoOffset = startOff;
+        memoConstant = true;
+        return startOff;
+    }
+    // Transition day: do NOT memoize — the offset is not a function of the
+    // day here, and a later call for a different instant in the same day
+    // must re-resolve.
+    memoConstant = false;
     return rawTimezoneOffsetMs(timezone, utcMs);
 }
 
 /** Drop every cached offset. Exposed for tests and long-lived hosts. */
 export function clearTimezoneOffsetCache(): void {
-    boundaryCache.clear();
+    boundaryCaches.clear();
+    daysTz = '';
+    daysMap = null;
     formatterCache.clear();
+    memoConstant = false;
+    memoTz = '';
+    memoDayIndex = NaN;
 }

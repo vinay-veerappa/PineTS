@@ -739,16 +739,17 @@ export class Context {
 
         if (!Array.isArray(source) && typeof source === 'object') return source;
 
-        if (!this.params[name]) this.params[name] = [];
+        let arr = this.params[name];
+        if (!arr) arr = this.params[name] = [];
         if (Array.isArray(source)) {
             return new Series(source, index || 0);
         } else {
-            if (this.params[name].length === 0) {
-                this.params[name].push(source);
+            if (arr.length === 0) {
+                arr.push(source);
             } else {
-                this.params[name][this.params[name].length - 1] = source;
+                arr[arr.length - 1] = source;
             }
-            return new Series(this.params[name], index || 0);
+            return new Series(arr, index || 0);
         }
     }
 

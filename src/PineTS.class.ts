@@ -1235,19 +1235,34 @@ export class PineTS {
             }
 
             //shift context
+            // THE per-bar cost centre. This opens the next bar's slot on every
+            // live series, so it runs `series x bars` times — 11.0M times on a
+            // 10k-bar HTF_EMA execute (1 164 series, 1 102 pushes per bar), and
+            // it was 8-9% of self time. Two things were pure overhead:
+            //   * `container[ctxVarName][key]` re-read the bag on every key;
+            //   * `item.get(0)` paid a call plus Series.get's fractional-offset
+            //     guard 11M times to fetch the last element.
+            // Both are inlined below; what gets pushed is unchanged.
             const shiftVariables = (container: any) => {
                 for (let ctxVarName of contextVarNames) {
-                    if (!container[ctxVarName]) continue;
-                    for (let key in container[ctxVarName]) {
-                        const item = container[ctxVarName][key];
+                    const bag = container[ctxVarName];
+                    if (!bag) continue;
+                    for (let key in bag) {
+                        const item = bag[key];
 
                         if (item instanceof Series) {
-                            const val = item.get(0);
-                            item.data.push(val);
+                            // Inlined `item.get(0)` — identical, including the
+                            // out-of-range -> NaN result and the truncation of a
+                            // fractional offset. The read is evaluated as the
+                            // push ARGUMENT, so it still sees the pre-push length.
+                            const d = item.data;
+                            let lookback = item.offset;
+                            if (!Number.isInteger(lookback)) lookback = Math.trunc(lookback);
+                            const realIndex = d.length - 1 - lookback;
+                            d.push(realIndex < 0 || realIndex >= d.length ? NaN : d[realIndex]);
                         } else if (Array.isArray(item)) {
                             // Legacy array support during transition
-                            const val = item[item.length - 1];
-                            item.push(val);
+                            item.push(item[item.length - 1]);
                         }
                     }
                 }

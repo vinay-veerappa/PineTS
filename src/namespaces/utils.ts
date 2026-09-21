@@ -68,15 +68,39 @@ export function extractCallsiteId(args: any[]): string | undefined {
  * @param types - The types to parse, each type is a string representing the type of the argument.
  * @returns The parsed arguments, the arguments are parsed according to the signatures and types.
  */
-export function parseArgsForPineParams<T>(args: any[], signatures: any[], types: Record<string, string>, override?: Record<string, any>) {
-    if (Array.isArray(signatures) && typeof signatures[0] === 'string') {
-        signatures = [signatures];
-    }
+// The return type is DECLARED, not inferred. It was inferred from the single
+// three-way spread that used to be the only exit; adding the no-merge early
+// return below made it a union and narrowed away the index signature callers
+// rely on (`Plots.ts` reads `.series` off a `PlotCharOptions`). Pinning it to
+// what the spread inferred keeps every caller's view identical.
+export function parseArgsForPineParams<T>(
+    args: any[],
+    signatures: any[],
+    types: Record<string, string>,
+    override?: Record<string, any>,
+): T & Partial<T> & Record<string, any> {
+    // HOT PATH. This runs once per namespaced Pine call PER BAR — a profiled
+    // 10k-bar HTF_EMA execute spent 10% of self time here, most of it in
+    // allocation the matching does not need. Three allocations were removed
+    // without changing what it decides:
+    //   1. the `[signatures]` wrapper for the single-signature shape (by far
+    //      the common one) — `single ?? signatures[o]` reads it in place;
+    //   2. the `signatures.map(...)` INSIDE the argument loop, which built a
+    //      throwaway array per ARGUMENT per call;
+    //   3. the three-way spread on return, when there is nothing to merge.
+    // `options` is created here and never escapes by another route, so
+    // returning it directly is indistinguishable from returning a copy.
+    const single = Array.isArray(signatures) && typeof signatures[0] === 'string' ? signatures : null;
+    const sigCount = single ? 1 : signatures.length;
+
     const options: T = {} as T;
 
-    let options_arg: Partial<T> = {};
+    // `undefined` (not `{}`) is the "no named-args bag seen" marker, so the
+    // return can tell the empty case apart and skip the merge. Spreading
+    // `undefined` is a no-op, so the merge path is unchanged.
+    let options_arg: Partial<T> | undefined = undefined;
 
-    const valid = new Array(signatures.length).fill(true);
+    const valid = new Array(sigCount).fill(true);
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
 
@@ -85,10 +109,11 @@ export function parseArgsForPineParams<T>(args: any[], signatures: any[], types:
             break;
         }
 
-        const curOptions = signatures.map((e, idx) => (valid[idx] ? e[i] : undefined));
-
-        for (let o = 0; o < curOptions.length; o++) {
-            const optionName = curOptions[o];
+        for (let o = 0; o < sigCount; o++) {
+            // An already-invalidated signature contributed `undefined` to the
+            // old `curOptions` and re-invalidated itself; skipping is the same.
+            if (!valid[o]) continue;
+            const optionName = (single ?? signatures[o])[i];
             if (optionName === undefined) {
                 valid[o] = false;
                 continue;
@@ -102,7 +127,7 @@ export function parseArgsForPineParams<T>(args: any[], signatures: any[], types:
             if (typeof arg === 'number' && isNaN(arg) && (expectedType === 'number' || expectedType === 'series')) {
                 options[optionName] = arg;
             } else {
-                const typeChecker = TYPE_CHECK[types[optionName]];
+                const typeChecker = TYPE_CHECK[expectedType];
                 if (typeof typeChecker === 'function' && typeChecker(arg)) {
                     options[optionName] = arg;
                 } else {
@@ -116,5 +141,6 @@ export function parseArgsForPineParams<T>(args: any[], signatures: any[], types:
     // Without this order, multi-signature matching can produce spurious positional
     // entries (e.g., NaN at position 2 matching 'border_color' in a secondary
     // signature) that overwrite explicit named arguments.
+    if (options_arg === undefined && override === undefined) return options as T & Partial<T> & Record<string, any>;
     return { ...options, ...options_arg, ...override };
 }
