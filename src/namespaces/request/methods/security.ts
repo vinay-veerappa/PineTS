@@ -3,7 +3,8 @@
 import { PineTS } from '../../../PineTS.class';
 import { Series } from '../../../Series';
 import { splitTickerModifier, withTickerModifier } from '../../../tickerModifier';
-import { TIMEFRAMES, normalizeTimeframe } from '../utils/TIMEFRAMES';
+import { isValidTimeframe, normalizeTimeframe } from '../utils/TIMEFRAMES';
+import { timeframeToSeconds } from '../../../timeframe';
 import { findSecContextIdx } from '../utils/findSecContextIdx';
 import { findLTFContextIdx } from '../utils/findLTFContextIdx';
 import { parseArgsForPineParams } from '../../utils';
@@ -171,12 +172,21 @@ export function security(context: any) {
             return Array.isArray(resolved) ? [resolved] : resolved;
         }
 
-        const ctxTimeframeIdx = TIMEFRAMES.indexOf(normalizeTimeframe(context.timeframe));
-        const reqTimeframeIdx = TIMEFRAMES.indexOf(normalizeTimeframe(_timeframe));
+        // Ordering is by real DURATION, not by position in a whitelist. The old
+        // `TIMEFRAMES.indexOf(...)` rejected every timeframe missing from a 13-entry
+        // array — '720' (12h), '90', '2D' — with a bare "Invalid timeframe", even
+        // though the data layer could serve them by aggregation.
+        const ctxTf = normalizeTimeframe(context.timeframe);
+        const reqTf = normalizeTimeframe(_timeframe);
 
-        if (ctxTimeframeIdx == -1 || reqTimeframeIdx == -1) {
-            throw new Error('Invalid timeframe');
+        if (!isValidTimeframe(ctxTf) || !isValidTimeframe(reqTf)) {
+            throw new Error(
+                `Invalid timeframe: chart '${context.timeframe}', requested '${_timeframe}'`,
+            );
         }
+
+        const ctxTimeframeSec = timeframeToSeconds(ctxTf);
+        const reqTimeframeSec = timeframeToSeconds(reqTf);
 
         // Same-timeframe shortcut is only valid when the requested symbol is the
         // chart's symbol — at that point the secondary would just re-evaluate the
@@ -192,14 +202,14 @@ export function security(context: any) {
         const reqModifier = reqParts.modifier === 'standard' ? null : reqParts.modifier; // ";standard" ≡ no modifier
         const isSameSymbol = !_symbol || _symbol === '' || (reqParts.symbol === ctxParts.symbol && reqModifier === chartModifier);
 
-        if (ctxTimeframeIdx === reqTimeframeIdx && isSameSymbol) {
+        if (ctxTimeframeSec === reqTimeframeSec && isSameSymbol) {
             // Resolve any helper objects (TimeComponentHelper, NAHelper, Series, etc.)
             // in the expression that haven't been extracted to their primitive values yet.
             const resolved = resolveExprValue(_expression);
             return Array.isArray(resolved) ? [resolved] : resolved;
         }
 
-        const isLTF = ctxTimeframeIdx > reqTimeframeIdx;
+        const isLTF = ctxTimeframeSec > reqTimeframeSec;
 
         const myOpenTime = Series.from(context.data.openTime).get(0);
         const myCloseTime = Series.from(context.data.closeTime).get(0);

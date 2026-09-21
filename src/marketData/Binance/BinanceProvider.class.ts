@@ -15,7 +15,11 @@ const timeframe_to_binance = {
     '180': null, // 3 hours (not directly supported by Binance, needs custom handling)
     '240': '4h', // 4 hours
     '4H': '4h', // 4 hours
+    '360': '6h', // 6 hours
+    '480': '8h', // 8 hours
+    '720': '12h', // 12 hours
     '1D': '1d', // 1 day
+    '3D': '3d', // 3 days
     D: '1d', // 1 day
     '1W': '1w', // 1 week
     W: '1w', // 1 week
@@ -264,7 +268,11 @@ export class BinanceProvider extends BaseProvider<BinanceProviderConfig> {
     }
 
     protected getSupportedTimeframes(): Set<string> {
-        return new Set(['1', '3', '5', '15', '30', '60', '120', '240', 'D', 'W', 'M']);
+        // Exactly what the Binance klines endpoint serves natively. Anything else
+        // (45m, 3h, 90m, ...) is aggregated by BaseProvider from the largest of these
+        // that divides it, so this set is a statement about the VENUE, not a limit on
+        // which timeframes PineTS accepts.
+        return new Set(['1', '3', '5', '15', '30', '60', '120', '240', '360', '480', '720', 'D', '3D', 'W', 'M']);
     }
 
     protected async _getMarketDataNative(tickerId: string, timeframe: string, limit?: number, sDate?: number, eDate?: number): Promise<Kline[]> {

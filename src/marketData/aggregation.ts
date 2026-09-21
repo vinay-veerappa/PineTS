@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { Kline, TIMEFRAME_SECONDS } from './types';
-
-// ── Ordered list of all canonical timeframes (ascending by duration) ────
-
-const ORDERED_TIMEFRAMES = [
-    '1S', '5S', '10S', '15S', '30S',
-    '1', '3', '5', '15', '30', '45',
-    '60', '120', '180', '240',
-    'D', 'W', 'M',
-];
+import { Kline } from './types';
+import { parseTimeframe, timeframeToSeconds } from '../timeframe';
 
 // ── Public API ──────────────────────────────────────────────────────────
 
@@ -20,7 +12,7 @@ const ORDERED_TIMEFRAMES = [
  * Strategy:
  * - **W/M targets**: always use `'D'` (calendar-based grouping).
  * - **All others**: pick the largest supported timeframe whose duration
- *   evenly divides the target duration (using `TIMEFRAME_SECONDS`).
+ *   evenly divides the target duration.
  *
  * @returns The best sub-timeframe, or `null` if none found.
  */
@@ -28,26 +20,36 @@ export function selectSubTimeframe(
     targetTimeframe: string,
     supportedTimeframes: Set<string>,
 ): string | null {
-    // Weekly and Monthly always aggregate from Daily
-    if (targetTimeframe === 'W' || targetTimeframe === 'M') {
+    // Week and month targets are CALENDAR periods, not durations: a month is 28-31 days,
+    // so no fixed ratio of sub-candles can express one. They are always grouped from
+    // daily bars by calendar key instead (see `_aggregateByWeek` / `_aggregateByMonth`).
+    const targetSpec = parseTimeframe(targetTimeframe);
+    if (!targetSpec) return null;
+    if (targetSpec.unit === 'W' || targetSpec.unit === 'M') {
         return supportedTimeframes.has('D') ? 'D' : null;
     }
 
-    const targetSeconds = TIMEFRAME_SECONDS[targetTimeframe];
-    if (!targetSeconds) return null;
+    const targetSeconds = targetSpec.seconds;
 
-    // Consider only timeframes strictly smaller than the target
-    const candidates = ORDERED_TIMEFRAMES.filter(tf =>
-        tf !== 'W' && tf !== 'M' &&
-        supportedTimeframes.has(tf) &&
-        TIMEFRAME_SECONDS[tf] < targetSeconds &&
-        targetSeconds % TIMEFRAME_SECONDS[tf] === 0,
-    );
+    // Candidates come from what the PROVIDER actually serves, ordered by real duration.
+    // Deriving the order here (rather than filtering a hard-coded list) is what lets an
+    // arbitrary target like '90' or '720' find a sub-timeframe: previously a target
+    // absent from the lookup table scored `undefined` and bailed, even when the provider
+    // served a timeframe that divides it exactly.
+    const candidates = [...supportedTimeframes]
+        .map(tf => ({ tf, spec: parseTimeframe(tf) }))
+        .filter(({ spec }) => {
+            if (!spec) return false;
+            // A calendar period can never be a fixed-ratio divisor of a duration.
+            if (spec.unit === 'W' || spec.unit === 'M') return false;
+            return spec.seconds < targetSeconds && targetSeconds % spec.seconds === 0;
+        })
+        .sort((a, b) => a.spec!.seconds - b.spec!.seconds);
 
     if (candidates.length === 0) return null;
 
-    // Pick the largest (last in ascending order) — fewest API calls
-    return candidates[candidates.length - 1];
+    // Pick the largest divisor — fewest sub-candles to fetch and merge
+    return candidates[candidates.length - 1].tf;
 }
 
 /**
@@ -57,12 +59,13 @@ export function selectSubTimeframe(
  * For calendar-based (W/M from D): returns `Infinity` to signal variable grouping.
  */
 export function getAggregationRatio(targetTimeframe: string, subTimeframe: string): number {
-    if (targetTimeframe === 'W' || targetTimeframe === 'M') {
+    const targetSpec = parseTimeframe(targetTimeframe);
+    if (targetSpec && (targetSpec.unit === 'W' || targetSpec.unit === 'M')) {
         return Infinity; // Calendar-based grouping — variable bars per group
     }
-    const targetSec = TIMEFRAME_SECONDS[targetTimeframe];
-    const subSec = TIMEFRAME_SECONDS[subTimeframe];
-    if (!targetSec || !subSec || subSec === 0) return Infinity;
+    const targetSec = timeframeToSeconds(targetTimeframe);
+    const subSec = timeframeToSeconds(subTimeframe);
+    if (!targetSec || !subSec) return Infinity;
     return targetSec / subSec;
 }
 
@@ -90,11 +93,12 @@ export function aggregateCandles(
 ): Kline[] {
     if (subCandles.length === 0) return [];
 
-    if (targetTimeframe === 'W') {
-        return _aggregateByWeek(subCandles);
+    const targetSpec = parseTimeframe(targetTimeframe);
+    if (targetSpec?.unit === 'W') {
+        return _aggregateByWeek(subCandles, targetSpec.multiplier);
     }
-    if (targetTimeframe === 'M') {
-        return _aggregateByMonth(subCandles);
+    if (targetSpec?.unit === 'M') {
+        return _aggregateByMonth(subCandles, targetSpec.multiplier);
     }
 
     // Fixed-ratio aggregation with session-boundary detection
@@ -142,19 +146,51 @@ function _aggregateByRatio(candles: Kline[], ratio: number): Kline[] {
     return result;
 }
 
-/** Group daily candles by ISO week. */
-function _aggregateByWeek(dailyCandles: Kline[]): Kline[] {
+/**
+ * Group daily candles into `multiplier`-week bars.
+ *
+ * Buckets are ANCHORED, not merely consecutive: the key is the Monday-aligned week
+ * ordinal divided by the multiplier, so a '2W' bar always covers the same pair of
+ * calendar weeks no matter where the loaded data happens to start. Chunking the
+ * groups in arrival order instead would shift every bucket when the start date moved,
+ * which makes two runs over overlapping ranges disagree about the same bar.
+ */
+function _aggregateByWeek(dailyCandles: Kline[], multiplier: number = 1): Kline[] {
+    const keyOf = multiplier <= 1
+        ? (t: number) => _getISOWeekKey(t)
+        : (t: number) => String(Math.floor(_weekOrdinal(t) / multiplier));
+    return _groupByKey(dailyCandles, keyOf);
+}
+
+/**
+ * Group daily candles into `multiplier`-month bars.
+ *
+ * Anchored to the calendar the same way as weeks: the month ordinal
+ * (`year * 12 + month`) divided by the multiplier, so '3M' yields real calendar
+ * quarters (Jan-Mar, Apr-Jun, ...) rather than three months counted from whenever
+ * the data starts.
+ */
+function _aggregateByMonth(dailyCandles: Kline[], multiplier: number = 1): Kline[] {
+    return _groupByKey(dailyCandles, (t: number) => {
+        const d = new Date(t);
+        const ordinal = d.getUTCFullYear() * 12 + d.getUTCMonth();
+        return multiplier <= 1 ? String(ordinal) : String(Math.floor(ordinal / multiplier));
+    });
+}
+
+/** Merge runs of candles that share a bucket key. */
+function _groupByKey(candles: Kline[], keyOf: (openTime: number) => string): Kline[] {
     const groups: Kline[][] = [];
     let currentGroup: Kline[] = [];
-    let currentWeekKey = '';
+    let currentKey = '';
 
-    for (const candle of dailyCandles) {
-        const weekKey = _getISOWeekKey(candle.openTime);
-        if (weekKey !== currentWeekKey && currentGroup.length > 0) {
+    for (const candle of candles) {
+        const key = keyOf(candle.openTime);
+        if (key !== currentKey && currentGroup.length > 0) {
             groups.push(currentGroup);
             currentGroup = [];
         }
-        currentWeekKey = weekKey;
+        currentKey = key;
         currentGroup.push(candle);
     }
     if (currentGroup.length > 0) groups.push(currentGroup);
@@ -162,25 +198,15 @@ function _aggregateByWeek(dailyCandles: Kline[]): Kline[] {
     return groups.map(_mergeGroup);
 }
 
-/** Group daily candles by calendar month. */
-function _aggregateByMonth(dailyCandles: Kline[]): Kline[] {
-    const groups: Kline[][] = [];
-    let currentGroup: Kline[] = [];
-    let currentMonthKey = '';
-
-    for (const candle of dailyCandles) {
-        const d = new Date(candle.openTime);
-        const monthKey = `${d.getUTCFullYear()}-${d.getUTCMonth()}`;
-        if (monthKey !== currentMonthKey && currentGroup.length > 0) {
-            groups.push(currentGroup);
-            currentGroup = [];
-        }
-        currentMonthKey = monthKey;
-        currentGroup.push(candle);
-    }
-    if (currentGroup.length > 0) groups.push(currentGroup);
-
-    return groups.map(_mergeGroup);
+/**
+ * Whole weeks since the Monday on/before the epoch.
+ *
+ * 1970-01-01 was a THURSDAY, so dividing the raw timestamp by a week would put the
+ * boundary on a Thursday. Shift back to Monday 1969-12-29 first.
+ */
+const MONDAY_BEFORE_EPOCH_MS = -3 * 86_400_000;
+function _weekOrdinal(timestampMs: number): number {
+    return Math.floor((timestampMs - MONDAY_BEFORE_EPOCH_MS) / 604_800_000);
 }
 
 /** Merge a group of candles into a single aggregated candle. */

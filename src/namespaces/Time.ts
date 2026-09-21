@@ -5,6 +5,7 @@ import { parseArgsForPineParams } from './utils';
 import { parseSessionSpec, isInSessionSpec } from './sessionSpec';
 import { PineRuntimeError } from '../errors/PineRuntimeError';
 import { timezoneOffsetMs } from './tzOffset';
+import { canonicalizeTimeframe, timeframeToSeconds } from '../timeframe';
 
 // ── Timeframe alignment utilities ───────────────────────────────────
 
@@ -14,12 +15,7 @@ import { timezoneOffsetMs } from './tzOffset';
  */
 export function normalizeTimeframe(tf: string): string {
     if (!tf) return '';
-    const s = tf.trim().toUpperCase();
-    if (s === '1D' || s === 'D') return 'D';
-    if (s === '1W' || s === 'W') return 'W';
-    if (s === '1M' || s === 'M') return 'M';
-    // Strip leading "1" from minute timeframes only if it's just "1" (1 minute)
-    return s;
+    return canonicalizeTimeframe(tf.trim());
 }
 
 /**
@@ -70,11 +66,11 @@ export function alignToTimeframe(timestamp: number, tf: string): number {
  * "5" → 5, "60" → 60, "240" → 240, "D" → 1440, "W" → 10080, "M" → 43200
  */
 function parseTimeframeMinutes(tf: string): number {
-    if (tf === 'D') return 1440;
-    if (tf === 'W') return 10080;
-    if (tf === 'M') return 43200;
-    const n = parseInt(tf, 10);
-    return isNaN(n) ? 1440 : n;
+    // `parseInt` alone was wrong for every timeframe carrying a unit: '30S' scored 30
+    // (thirty MINUTES, not thirty seconds) and '2D' scored 2. Both silently produced a
+    // bar alignment off by orders of magnitude.
+    const seconds = timeframeToSeconds(tf);
+    return seconds > 0 ? seconds / 60 : 1440;
 }
 
 // ── Shared timezone utility ──────────────────────────────────────────

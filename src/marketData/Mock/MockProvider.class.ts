@@ -201,7 +201,12 @@ export class MockProvider extends BaseProvider<MockProviderConfig> {
     }
 
     protected getSupportedTimeframes(): Set<string> {
-        return new Set(['1', '3', '5', '15', '30', '45', '60', '120', '180', '240', 'D', 'W', 'M']);
+        // ONLY the timeframes that have fixture files in tests/compatibility/_data.
+        // This set used to claim '45', '180' and others with no fixture behind them;
+        // BaseProvider believed the claim, took the native fast path, found no file and
+        // returned zero bars — instead of aggregating from the '60' fixture that exists.
+        // A provider must declare what it can actually deliver, not what it wishes it had.
+        return new Set(['15', '60', '240', 'D', 'W']);
     }
 
     /**

@@ -1,45 +1,12 @@
 import { Series } from '../Series';
 import { alignToTimeframe, normalizeTimeframe as normalizeTFFromTime } from './Time';
+import { canonicalizeTimeframe, parseTimeframe, timeframeToSeconds } from '../timeframe';
 const TF_UNITS = ['S', 'D', 'W', 'M'];
 
-/**
- * Normalize a raw timeframe string to Pine Script canonical format.
- * Pine canonical: minutes as plain integers ("1", "60", "240"), "D", "W", "M", or seconds as "1S".
- * Common inputs: "1d", "1D", "4h", "1w", "1W", "1m" (1-minute), "1M" (1-month).
- */
-const NORMALIZE_MAP: Record<string, string> = {
-    '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30', '45m': '45',
-    '1h': '60', '2h': '120', '3h': '180', '4h': '240',
-    '1d': 'D', '1w': 'W', '1M': 'M',
-};
-
+/** Canonical Pine spelling. Delegates to the shared parser — see src/timeframe.ts. */
 function normalizeTF(tf: string): string {
     if (!tf) return tf;
-
-    // Already canonical minute integers?
-    if (/^\d+$/.test(tf)) return tf;
-
-    // Direct map (case-sensitive first for '1M' vs '1m')
-    if (NORMALIZE_MAP[tf]) return NORMALIZE_MAP[tf];
-
-    // Try lowercase (handles '1H', '4H', '1D', '1W' etc.)
-    const lower = tf.toLowerCase();
-    if (NORMALIZE_MAP[lower]) return NORMALIZE_MAP[lower];
-
-    // Single letter: d→D, w→W, m→M, s→S
-    if (tf.length === 1) {
-        const upper = tf.toUpperCase();
-        if (['D', 'W', 'M', 'S'].includes(upper)) return upper;
-    }
-
-    // Uppercase last char: "2D", "3W", "12M", "30S"
-    const lastChar = tf.slice(-1).toUpperCase();
-    if (['D', 'W', 'M', 'S'].includes(lastChar)) {
-        const num = parseInt(tf);
-        if (!isNaN(num)) return num + lastChar;
-    }
-
-    return tf;
+    return canonicalizeTimeframe(tf);
 }
 
 export class Timeframe {
@@ -151,29 +118,7 @@ export class Timeframe {
         return '12M';
     }
     public in_seconds(timeframe?: string) {
-        if (timeframe === undefined || timeframe === null) {
-            timeframe = this.normalized;
-        } else {
-            timeframe = normalizeTF(timeframe);
-        }
-        const unit = timeframe.slice(-1).toUpperCase();
-        const multiplier = parseInt(timeframe);
-        if (unit === 'S') {
-            return isNaN(multiplier) ? 1 : multiplier;
-        }
-        if (unit === 'D') {
-            return (isNaN(multiplier) ? 1 : multiplier) * 60 * 60 * 24;
-        }
-        if (unit === 'W') {
-            return (isNaN(multiplier) ? 1 : multiplier) * 60 * 60 * 24 * 7;
-        }
-        if (unit === 'M') {
-            return (isNaN(multiplier) ? 1 : multiplier) * 60 * 60 * 24 * 30;
-        }
-        // Minutes (no unit suffix or implicit minutes)
-        if (!isNaN(multiplier)) {
-            return multiplier * 60;
-        }
-        return 0;
+        const tf = timeframe === undefined || timeframe === null ? this.normalized : timeframe;
+        return timeframeToSeconds(tf);
     }
 }

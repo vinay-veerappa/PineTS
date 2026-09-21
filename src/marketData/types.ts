@@ -35,7 +35,11 @@ export const INTERVAL_DURATION_MS: Record<string, number> = {
     '1h':  60 * 60 * 1000,
     '2h':  2 * 60 * 60 * 1000,
     '4h':  4 * 60 * 60 * 1000,
+    '6h':  6 * 60 * 60 * 1000,
+    '8h':  8 * 60 * 60 * 1000,
+    '12h': 12 * 60 * 60 * 1000,
     '1d':  24 * 60 * 60 * 1000,
+    '3d':  3 * 24 * 60 * 60 * 1000,
     '1w':  7 * 24 * 60 * 60 * 1000,
     '1M':  30 * 24 * 60 * 60 * 1000,
 };
@@ -53,6 +57,14 @@ export type PeriodType = 'second' | 'minute' | 'hour' | 'day' | 'week' | 'month'
  * D/W/M values are approximate — used for ratio math, not calendar grouping.
  */
 //prettier-ignore
+/**
+ * @deprecated NOT the source of truth — use `timeframeToSeconds()` from `src/timeframe.ts`.
+ *
+ * This table only knows the timeframes somebody remembered to add to it, which is exactly
+ * how '720' (12h), '90' and '2D' came to return `undefined` and silently yield zero bars.
+ * It is retained solely because it is exported from the package index and consumers may
+ * read it. Nothing inside PineTS looks a timeframe up here any more.
+ */
 export const TIMEFRAME_SECONDS: Record<string, number> = {
     // Seconds (TradingView format: "NS")
     '1S': 1, '5S': 5, '10S': 10, '15S': 15, '30S': 30,
@@ -69,6 +81,11 @@ export const TIMEFRAME_SECONDS: Record<string, number> = {
  * Used by aggregation to determine grouping strategy.
  */
 //prettier-ignore
+/**
+ * @deprecated NOT the source of truth — use `parseTimeframe()` from `src/timeframe.ts`,
+ * whose `{multiplier, unit}` carries the same information for ANY timeframe. Same caveat
+ * as `TIMEFRAME_SECONDS`: exported for consumers, unused internally.
+ */
 export const TIMEFRAME_PERIOD_INFO: Record<string, { periodType: PeriodType; multiplier: number }> = {
     '1S':  { periodType: 'second', multiplier: 1 },
     '5S':  { periodType: 'second', multiplier: 5 },
