@@ -67,6 +67,47 @@ export function createScopedVariableAccess(name: string, scopeManager: ScopeMana
     return ASTFactory.createGetCall(varRef, 0);
 }
 
+/**
+ * Scope the leaf base identifier of a MemberExpression chain (`a.b.c` -> `a`).
+ *
+ * `transformMemberExpression` deliberately early-returns for non-computed access,
+ * relying on the top-level identifier walker in MainTransformer to rename the base
+ * afterwards. That walker never runs on a node that is about to be wrapped in
+ * `$.param(...)` on the spot, so the base identifier survives BARE into the emitted
+ * code and throws `ReferenceError: <name> is not defined` on the first bar.
+ *
+ * Two argument positions hit this, and both call here:
+ *   - `bar.low[1]`          — a computed access on a UDT instance
+ *   - `E st = E.A`          — an enum member as a UDT field default, which stage 1
+ *                             emits as the tuple `['E', E.A]`
+ *
+ * Only user-declared variables are rewritten; built-ins, namespaces, loop variables,
+ * root params and local series vars are left alone.
+ */
+export function scopeMemberExpressionBase(node: any, scopeManager: ScopeManager): void {
+    let holder: any = node;
+    while (holder && holder.type === 'MemberExpression' && holder.object) {
+        if (holder.object.type === 'Identifier') {
+            const base = holder.object;
+            const [scopedName] = scopeManager.getVariable(base.name);
+            const isUserVariable = scopedName !== base.name;
+            if (
+                isUserVariable &&
+                !scopeManager.isContextBound(base.name) &&
+                !scopeManager.isRootParam(base.name) &&
+                !scopeManager.isLoopVariable(base.name) &&
+                !scopeManager.isLocalSeriesVar(base.name) &&
+                !NAMESPACES_LIKE.includes(base.name) &&
+                !KNOWN_NAMESPACES.includes(base.name)
+            ) {
+                holder.object = createScopedVariableAccess(base.name, scopeManager);
+            }
+            return;
+        }
+        holder = holder.object;
+    }
+}
+
 export function transformArrayIndex(node: any, scopeManager: ScopeManager): void {
     if (node.computed && node.property.type === 'Identifier') {
         // If index is a loop variable, we still need to transform the object to use $.get()
@@ -1042,6 +1083,12 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
                 }
                 if (element.type === 'MemberExpression') {
                     transformMemberExpression(element, namespace, scopeManager);
+                    // Same reason as the `bar.low[1]` call site below: this element is
+                    // about to be wrapped in $.param(...) so the top-level identifier
+                    // walker never reaches its base. The case that needs it is a UDT
+                    // field defaulted to an enum member (`E st = E.A`), which arrives
+                    // here as the tuple element `E.A`.
+                    scopeMemberExpressionBase(element, scopeManager);
                     return element;
                 }
                 return element;
@@ -1102,36 +1149,9 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
             transformCallExpression(arg.object, scopeManager);
         } else if (arg.object.type === 'MemberExpression') {
             transformMemberExpression(arg.object, '', scopeManager);
-            // Regression: `transformMemberExpression` early-returns for non-computed
-            // access on context-bound user variables (relying on a later top-level
-            // identifier walker to scope the base). But here the result is about to
-            // be wrapped in `$.param(...)` immediately, so the later walker never
-            // runs and the base identifier ends up bare in the emitted code.
-            // Pattern that hits this:  `bar.low[1]` where `bar` is a UDT instance.
-            // Walk into the MemberExpression chain and scope the leaf base when it
-            // is a user-declared variable (not a built-in / namespace / loop var /
-            // function param / local series).
-            let baseHolder: any = arg.object;
-            while (baseHolder && baseHolder.type === 'MemberExpression' && baseHolder.object) {
-                if (baseHolder.object.type === 'Identifier') {
-                    const base = baseHolder.object;
-                    const [scopedName] = scopeManager.getVariable(base.name);
-                    const isUserVariable = scopedName !== base.name;
-                    if (
-                        isUserVariable &&
-                        !scopeManager.isContextBound(base.name) &&
-                        !scopeManager.isRootParam(base.name) &&
-                        !scopeManager.isLoopVariable(base.name) &&
-                        !scopeManager.isLocalSeriesVar(base.name) &&
-                        !NAMESPACES_LIKE.includes(base.name) &&
-                        !KNOWN_NAMESPACES.includes(base.name)
-                    ) {
-                        baseHolder.object = createScopedVariableAccess(base.name, scopeManager);
-                    }
-                    break;
-                }
-                baseHolder = baseHolder.object;
-            }
+            // `bar.low[1]` where `bar` is a UDT instance — the base needs scoping
+            // here because the $.param(...) wrapper below outruns the walker.
+            scopeMemberExpressionBase(arg.object, scopeManager);
         } else if (arg.object.type === 'BinaryExpression') {
             arg.object = getParamFromBinaryExpression(arg.object, scopeManager, namespace);
         } else if (arg.object.type === 'LogicalExpression') {

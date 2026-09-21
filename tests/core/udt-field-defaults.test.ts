@@ -286,4 +286,58 @@ plot(t.dir, "dir")
         // dir must be -1
         expect(plots['dir'].data[0].value).toBe(-1);
     });
+
+    // ---- Enum-member defaults ---------------------------------------------
+    // `E st = E.A` used to emit the field tuple as `['E', E.A]` with `E` LEFT BARE
+    // while its declaration had been renamed to `$.let.glb1_E`, so the script
+    // transpiled clean and then threw `ReferenceError: E is not defined` on bar 1.
+    // The base of a MemberExpression sitting in an argument position that gets
+    // wrapped in `$.param(...)` is never reached by the top-level identifier
+    // walker — see `scopeMemberExpressionBase`.
+    it('an enum-member default resolves, and does not leave the enum unbound', async () => {
+        const code = `
+//@version=6
+indicator("UDT Enum Defaults")
+
+enum State
+    ACTIVE = "active"
+    FILLED = "filled"
+
+type gap
+    float top = 0
+    State st = State.FILLED
+
+g = gap.new()
+plot(g.st == State.FILLED ? 1 : 0, "is_filled")
+plot(g.st == State.ACTIVE ? 1 : 0, "is_active")
+plot(g.top, "top")
+`;
+        const { plots } = await pineTS.run(code);
+
+        expect(plots['is_filled'].data[0].value).toBe(1);
+        expect(plots['is_active'].data[0].value).toBe(0);
+        expect(plots['top'].data[0].value).toBe(0);
+    });
+
+    // Negative control for the above: a field merely TYPED as an enum emits no
+    // default expression at all, so it must not start carrying one.
+    it('an enum-typed field with no default is na, not the first member', async () => {
+        const code = `
+//@version=6
+indicator("UDT Enum No Default")
+
+enum State
+    ACTIVE = "active"
+    FILLED = "filled"
+
+type gap
+    State st
+
+g = gap.new()
+plot(na(g.st) ? 1 : 0, "st_is_na")
+`;
+        const { plots } = await pineTS.run(code);
+
+        expect(plots['st_is_na'].data[0].value).toBe(1);
+    });
 });
