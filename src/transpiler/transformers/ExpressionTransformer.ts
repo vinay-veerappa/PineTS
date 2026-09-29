@@ -14,10 +14,14 @@ import {
     FOOTPRINT_ROW_METHODS,
 } from '../settings';
 
-const UNDEFINED_ARG = {
-    type: 'Identifier',
-    name: 'undefined',
-};
+function createUndefinedArg(): any {
+    return {
+        type: 'Identifier',
+        name: 'undefined',
+        _skipTransformation: true,
+        _arrayAccessed: true,
+    };
+}
 
 /**
  * Build the third argument to a `*.param(value, idx, name)` call. The
@@ -419,7 +423,7 @@ export function transformMemberExpression(memberNode: any, originalParamName: st
                 ASTFactory.createContextIdentifier(),
                 ASTFactory.createIdentifier('param'),
             ),
-            arguments: [memberNode.object, UNDEFINED_ARG, makeParamNameArg(scopeManager, paramId)],
+            arguments: [memberNode.object, createUndefinedArg(), makeParamNameArg(scopeManager, paramId)],
             _transformed: true,
             _isParamCall: true,
         };
@@ -955,7 +959,7 @@ function getParamFromConditionalExpression(node: any, scopeManager: ScopeManager
     const paramCall = {
         type: 'CallExpression',
         callee: memberExpr,
-        arguments: [node, UNDEFINED_ARG, makeParamNameArg(scopeManager, nextParamId)],
+        arguments: [node, createUndefinedArg(), makeParamNameArg(scopeManager, nextParamId)],
         _transformed: true,
         _isParamCall: true,
     };
@@ -1346,7 +1350,7 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
             const paramCall = {
                 type: 'CallExpression',
                 callee: memberExpr,
-                arguments: [arg, UNDEFINED_ARG, makeParamNameArg(scopeManager, nextParamId)],
+                arguments: [arg, createUndefinedArg(), makeParamNameArg(scopeManager, nextParamId)],
                 _transformed: true,
                 _isParamCall: true,
             };
@@ -1377,7 +1381,7 @@ export function transformFunctionArgument(arg: any, namespace: string, scopeMana
     const paramCall = {
         type: 'CallExpression',
         callee: memberExpr,
-        arguments: [transformedArg, UNDEFINED_ARG, makeParamNameArg(scopeManager, nextParamId)],
+        arguments: [transformedArg, createUndefinedArg(), makeParamNameArg(scopeManager, nextParamId)],
         _transformed: true,
         _isParamCall: true,
     };

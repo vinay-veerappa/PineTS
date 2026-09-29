@@ -1388,7 +1388,9 @@ export function transformReturnStatement(node: any, scopeManager: ScopeManager):
                     Identifier(node: any, state: ScopeManager) {
                         transformIdentifier(node, state);
                         // Add array access if needed
-                        if (node.type === 'Identifier' && !node._arrayAccessed) {
+                        if (node.type === 'Identifier' && !node._arrayAccessed &&
+                            node.name !== 'undefined' && node.name !== 'NaN' && node.name !== 'Infinity' &&
+                            node.name !== 'null' && node.name !== 'Math' && !node._skipTransformation) {
                             addArrayAccess(node, state);
                             node._arrayAccessed = true;
                         }
