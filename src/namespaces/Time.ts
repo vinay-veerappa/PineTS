@@ -4,73 +4,15 @@ import { Series } from '../Series';
 import { parseArgsForPineParams } from './utils';
 import { parseSessionSpec, isInSessionSpec } from './sessionSpec';
 import { PineRuntimeError } from '../errors/PineRuntimeError';
+import { canonicalTimeframe, parseTimeframe, timeframeBarStart } from '../timeframe';
 import { timezoneOffsetMs } from './tzOffset';
-import { canonicalizeTimeframe, timeframeToSeconds } from '../timeframe';
 
-// ── Timeframe alignment utilities ───────────────────────────────────
-
-/**
- * Normalize a Pine Script timeframe string to a canonical form.
- * e.g. "1D" → "D", "60" → "60", "1W" → "W", "" → ""
- */
-export function normalizeTimeframe(tf: string): string {
-    if (!tf) return '';
-    return canonicalizeTimeframe(tf.trim());
-}
-
-/**
- * Compute the opening timestamp of the higher-timeframe bar that contains the given timestamp.
- *
- * For intraday TFs (minutes): floor to the nearest multiple of the TF duration within the day.
- * For daily: floor to UTC day start (00:00 UTC).
- * For weekly: floor to Monday 00:00 UTC.
- * For monthly: floor to 1st of month 00:00 UTC.
- */
-export function alignToTimeframe(timestamp: number, tf: string): number {
-    const MS_MIN = 60_000;
-    const MS_DAY = 86_400_000;
-
-    // Parse timeframe to minutes
-    const tfMinutes = parseTimeframeMinutes(tf);
-
-    if (tf === 'M') {
-        // Monthly: floor to 1st of month 00:00 UTC
-        const d = new Date(timestamp);
-        return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
-    }
-
-    if (tf === 'W') {
-        // Weekly: floor to Monday 00:00 UTC
-        const d = new Date(timestamp);
-        const day = d.getUTCDay(); // 0=Sun, 1=Mon, ...
-        const daysToMonday = day === 0 ? 6 : day - 1;
-        return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - daysToMonday);
-    }
-
-    if (tf === 'D' || tfMinutes >= 1440) {
-        // Daily: floor to 00:00 UTC
-        return Math.floor(timestamp / MS_DAY) * MS_DAY;
-    }
-
-    // Intraday: floor to the nearest multiple of the TF duration
-    // Align relative to the start of the UTC day
-    const tfMs = tfMinutes * MS_MIN;
-    const dayStart = Math.floor(timestamp / MS_DAY) * MS_DAY;
-    const elapsed = timestamp - dayStart;
-    const alignedElapsed = Math.floor(elapsed / tfMs) * tfMs;
-    return dayStart + alignedElapsed;
-}
-
-/**
- * Parse a Pine Script timeframe string to minutes.
- * "5" → 5, "60" → 60, "240" → 240, "D" → 1440, "W" → 10080, "M" → 43200
- */
-function parseTimeframeMinutes(tf: string): number {
-    // `parseInt` alone was wrong for every timeframe carrying a unit: '30S' scored 30
-    // (thirty MINUTES, not thirty seconds) and '2D' scored 2. Both silently produced a
-    // bar alignment off by orders of magnitude.
-    const seconds = timeframeToSeconds(tf);
-    return seconds > 0 ? seconds / 60 : 1440;
+// Current values of the arguments; named arguments arrive as a trailing plain object
+// whose values may be series too (`time(tf, session = sessionInput)`).
+function unwrapTimeArgs(args: any[]): any[] {
+    const unwrap = (a: any) => (a instanceof Series ? a.get(0) : a);
+    const isNamedArgs = (a: any) => a !== null && typeof a === 'object' && Object.getPrototypeOf(a) === Object.prototype;
+    return args.map((a) => (isNamedArgs(a) ? Object.fromEntries(Object.entries(a).map(([k, v]) => [k, unwrap(v)])) : unwrap(a)));
 }
 
 // ── Shared timezone utility ──────────────────────────────────────────
@@ -220,7 +162,7 @@ export class TimeHelper {
     }
 
     any(...args: any[]) {
-        const unwrapped = args.map((a) => (a instanceof Series ? a.get(0) : a));
+        const unwrapped = unwrapTimeArgs(args);
         const parsed = parseArgsForPineParams<any>(unwrapped, TIME_SIGNATURES, TIME_ARGS_TYPES);
 
         const barsBack = parsed.bars_back ?? 0;
@@ -232,16 +174,14 @@ export class TimeHelper {
         if (isNaN(currentTime) || currentTime == null) return NaN;
 
         // If timeframe is empty or matches the chart timeframe, return the bar's own time
-        const chartTF = this.context.timeframe || '';
-        const normalizedTF = normalizeTimeframe(timeframe);
-        const normalizedChartTF = normalizeTimeframe(chartTF);
-
         let htfBarTime: number;
-        if (!normalizedTF || normalizedTF === normalizedChartTF) {
+        if (!timeframe || canonicalTimeframe(timeframe) === canonicalTimeframe(this.context.timeframe)) {
             htfBarTime = currentTime;
         } else {
-            // Compute the opening timestamp of the higher-timeframe bar that contains this bar
-            htfBarTime = alignToTimeframe(currentTime, normalizedTF);
+            const tf = parseTimeframe(timeframe);
+            if (!tf) throw new PineRuntimeError(`Cannot parse resolution '${timeframe}'. - Invalid format`, 'time');
+            // Open time of the bar of `timeframe` that contains this bar
+            htfBarTime = timeframeBarStart(currentTime, tf);
         }
 
         // Session filtering
@@ -343,7 +283,7 @@ export class TimeComponentHelper {
     }
 
     any(...args: any[]) {
-        const unwrapped = args.map((a) => (a instanceof Series ? a.get(0) : a));
+        const unwrapped = unwrapTimeArgs(args);
 
         // No args → same as bare identifier (current bar's value)
         if (unwrapped.length === 0) {

@@ -1,162 +1,191 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 /**
- * Timeframe parsing — the single source of truth for what a timeframe string means.
+ * Timeframe strings — the single parser behind `request.security*`, `timeframe.*`,
+ * `time()` and the market-data providers.
  *
- * Before this module every layer carried its own hard-coded table of the timeframes it
- * recognised, and the tables disagreed: `request.security` accepted 13 strings, the
- * aggregator knew 18, and the seconds lookup knew 18 more. A timeframe present in one
- * table and absent from another failed in whichever layer was missing it, so `'90'` — a
- * perfectly ordinary 90-minute chart — returned zero bars even where the provider served
- * 1-minute data that divides it exactly.
- *
- * ## Canonical form (what TradingView / Pine Script itself uses)
- *
- * | Unit    | Canonical            | Notes                                        |
- * |---------|----------------------|----------------------------------------------|
- * | seconds | `'1S'`, `'30S'`      | always carries the `S`                       |
- * | minutes | `'1'`, `'60'`, `'720'` | BARE INTEGER. Hours are minutes: 3h = `'180'` |
- * | days    | `'D'`, `'2D'`        | multiplier 1 is written bare                 |
- * | weeks   | `'W'`, `'2W'`        | multiplier 1 is written bare                 |
- * | months  | `'M'`, `'3M'`        | multiplier 1 is written bare                 |
- *
- * ## The case trap
- *
- * `'1M'` is one MONTH and `'1m'` is one MINUTE. Anything that lowercases a timeframe
- * before matching turns a monthly chart into a 1-minute one. Parse case-sensitively for
- * the `M`/`m` pair and only then fall back to case-insensitive matching for `S/D/W/H`,
- * which are unambiguous.
+ * Pine timeframe strings: minutes as plain integers ("1", "60", "360", "1440"), seconds
+ * as "NS", and calendar units "ND", "NW", "NM" with the multiplier optional when it is 1
+ * ("D" = "1D"). PineTS also accepts the provider-style aliases used for chart timeframes
+ * ("1m", "15m", "1h", "4H", "1d", "1w", lowercase "d" / "w" / "m"); TradingView itself
+ * rejects those in scripts.
  */
 
-export type TimeframeUnit = 'S' | 'm' | 'D' | 'W' | 'M';
+export type TimeframeUnit = 'S' | '' | 'D' | 'W' | 'M';
 
-export interface TimeframeSpec {
-    /** How many of `unit`. Always >= 1. */
-    multiplier: number;
-    /** `'m'` is minutes; `'M'` is months. */
+export interface ParsedTimeframe {
+    /** '' = minutes */
     unit: TimeframeUnit;
-    /** Canonical Pine spelling — see the table above. */
-    canonical: string;
-    /**
-     * Duration in seconds. Months use a 30-day approximation and weeks a 7-day one, which
-     * is exact enough for the only two things seconds are used for: ordering two
-     * timeframes, and deciding whether one divides another. Never use it as a calendar.
-     */
-    seconds: number;
+    multiplier: number;
 }
 
-const SECONDS_PER: Record<TimeframeUnit, number> = {
-    S: 1,
-    m: 60,
-    D: 86_400,
-    W: 604_800,
-    M: 2_592_000, // 30d approximation — ordering/divisibility only
-};
+/** TradingView's month length in timeframe arithmetic: 365 / 12 days (2628003 s). */
+export const MONTH_SECONDS = 2628003;
 
-/** `<digits><unit-letter>` or bare `<digits>` (minutes) or a bare unit letter (multiplier 1). */
-const TF_PATTERN = /^(\d*)\s*([A-Za-z]?)$/;
+const DAY_MS = 86_400_000;
+const WEEK_MS = 7 * DAY_MS;
+const MAX_MINUTES = 1440;
 
-/**
- * Parse a timeframe string into its parts, or `null` if it is not a timeframe.
- *
- * Accepts canonical Pine (`'240'`, `'D'`, `'30S'`) and the common non-canonical spellings
- * people actually type (`'4h'`, `'1d'`, `'1W'`, `'12h'`). Returns `null` rather than
- * guessing, so callers can fail loudly.
- */
-export function parseTimeframe(tf: string | number | null | undefined): TimeframeSpec | null {
-    if (tf === null || tf === undefined) return null;
+const cache = new Map<string, ParsedTimeframe | null>();
 
-    const raw = String(tf).trim();
-    if (raw === '') return null;
+/** Parse a timeframe string. Returns `null` for anything that is not a timeframe (including ""). */
+export function parseTimeframe(timeframe: unknown): ParsedTimeframe | null {
+    if (typeof timeframe === 'number') timeframe = String(timeframe);
+    if (typeof timeframe !== 'string') return null;
+    if (cache.has(timeframe)) return cache.get(timeframe)!;
+    const parsed = parseUncached(timeframe.trim());
+    cache.set(timeframe, parsed);
+    return parsed;
+}
 
-    const m = TF_PATTERN.exec(raw);
-    if (!m) return null;
-
-    const [, digits, letterRaw] = m;
-
-    // Bare integer → minutes. This is the canonical Pine spelling for everything
-    // from 1 minute to 1440 minutes, and it is why hours have no unit letter.
-    if (letterRaw === '') {
-        if (digits === '') return null;
-        const n = parseInt(digits, 10);
-        return n > 0 ? makeSpec(n, 'm') : null;
-    }
-
+function parseUncached(tf: string): ParsedTimeframe | null {
+    const match = /^(\d*)([a-zA-Z]?)$/.exec(tf);
+    if (!match || tf === '') return null;
+    const digits = match[1];
+    const letter = match[2];
     const multiplier = digits === '' ? 1 : parseInt(digits, 10);
-    if (!(multiplier > 0)) return null;
+    if (!(multiplier >= 1)) return null;
 
-    // CASE-SENSITIVE first, and only for the M/m pair: 'M' is months, 'm' is minutes.
-    // Getting this wrong silently reinterprets a monthly chart as a 1-minute one.
-    if (letterRaw === 'M') return makeSpec(multiplier, 'M');
-    if (letterRaw === 'm') {
-        // Bare 'm' with no multiplier is not a TradingView timeframe at all, so it is
-        // pure ambiguity. Every normalizer this module replaced resolved it to months
-        // (they uppercased a lone letter), and there is a test pinning that, so keep it.
-        // Note this makes 'm' months while '1m' is one minute — inherited, not designed.
-        if (digits === '') return makeSpec(1, 'M');
-        return makeSpec(multiplier, 'm');
-    }
-
-    // The rest are unambiguous, so case does not matter.
-    switch (letterRaw.toUpperCase()) {
+    let parsed: ParsedTimeframe | null;
+    switch (letter) {
+        case '':
+            parsed = { unit: '', multiplier };
+            break;
         case 'S':
-            return makeSpec(multiplier, 'S');
+        case 's':
+            parsed = { unit: 'S', multiplier };
+            break;
         case 'D':
-            return makeSpec(multiplier, 'D');
+        case 'd':
+            parsed = { unit: 'D', multiplier };
+            break;
         case 'W':
-            return makeSpec(multiplier, 'W');
-        // 'h' is not Pine canonical, but it is what people type. Fold it into minutes
-        // so '4h' and '240' are the same timeframe rather than two near-misses.
+        case 'w':
+            parsed = { unit: 'W', multiplier };
+            break;
+        case 'M':
+            parsed = { unit: 'M', multiplier };
+            break;
+        case 'm':
+            // "15m" is 15 minutes (provider style); a bare "m" is a month.
+            parsed = digits === '' ? { unit: 'M', multiplier: 1 } : { unit: '', multiplier };
+            break;
         case 'H':
-            return makeSpec(multiplier * 60, 'm');
+        case 'h':
+            parsed = { unit: '', multiplier: multiplier * 60 };
+            break;
         default:
-            return null;
+            parsed = null;
+    }
+    if (parsed && parsed.unit === '' && parsed.multiplier > MAX_MINUTES) return null;
+    return parsed;
+}
+
+/**
+ * Pine string form of a timeframe. Calendar units with a multiplier of 1 are written
+ * without it ("D", "W", "M") unless `withUnitMultiplier` is set, which is how Pine v6
+ * reports `timeframe.period` and how `timeframe.from_seconds` always answers ("1D").
+ */
+export function formatTimeframe(tf: ParsedTimeframe, withUnitMultiplier = false): string {
+    if (tf.unit === '') return String(tf.multiplier);
+    if (tf.unit === 'S') return `${tf.multiplier}S`;
+    return tf.multiplier === 1 && !withUnitMultiplier ? tf.unit : `${tf.multiplier}${tf.unit}`;
+}
+
+/** Canonical key of a timeframe string ("1h" -> "60", "1D" -> "D", "2d" -> "2D"), or `null` when invalid. */
+export function canonicalTimeframe(timeframe: unknown): string | null {
+    const tf = parseTimeframe(timeframe);
+    return tf ? formatTimeframe(tf) : null;
+}
+
+/** Length in seconds, as `timeframe.in_seconds` computes it (a month is {@link MONTH_SECONDS}). */
+export function timeframeSeconds(tf: ParsedTimeframe): number {
+    switch (tf.unit) {
+        case 'S':
+            return tf.multiplier;
+        case '':
+            return tf.multiplier * 60;
+        case 'D':
+            return tf.multiplier * 86400;
+        case 'W':
+            return tf.multiplier * 604800;
+        case 'M':
+            return tf.multiplier * MONTH_SECONDS;
     }
 }
 
-function makeSpec(multiplier: number, unit: TimeframeUnit): TimeframeSpec {
-    return {
-        multiplier,
-        unit,
-        canonical: toCanonical(multiplier, unit),
-        seconds: multiplier * SECONDS_PER[unit],
-    };
+/** Timeframe string for a number of seconds, rounded up to the next valid timeframe (`timeframe.from_seconds`). */
+export function timeframeFromSeconds(seconds: number): string {
+    if (seconds >= 365 * 86400) return '12M';
+    if (seconds <= 30) {
+        const step = [1, 5, 10, 15, 30].find((s) => seconds <= s)!;
+        return `${step}S`;
+    }
+    if (seconds < 86400) return String(Math.ceil(seconds / 60));
+    if (seconds % 604800 === 0) return `${seconds / 604800}W`;
+    if (seconds % MONTH_SECONDS === 0) return `${seconds / MONTH_SECONDS}M`;
+    return `${Math.ceil(seconds / 86400)}D`;
 }
 
-function toCanonical(multiplier: number, unit: TimeframeUnit): string {
-    if (unit === 'm') return String(multiplier);
-    if (unit === 'S') return `${multiplier}S`;
-    // D / W / M: a multiplier of 1 is written bare ('D', not '1D')
-    return multiplier === 1 ? unit : `${multiplier}${unit}`;
-}
-
-/**
- * Canonical Pine spelling of a timeframe, or the input unchanged if it is unparseable.
- *
- * Returning the input rather than throwing preserves the behaviour every existing
- * `normalizeTimeframe` had — callers decide what an unknown timeframe means.
- */
-export function canonicalizeTimeframe(tf: string): string {
-    return parseTimeframe(tf)?.canonical ?? tf;
-}
-
-/** Duration in seconds, or `0` if unparseable (so falsy checks keep working). */
-export function timeframeToSeconds(tf: string | number | null | undefined): number {
-    return parseTimeframe(tf)?.seconds ?? 0;
-}
-
-/** True when `tf` denotes a whole day or longer (Pine's `timeframe.isdwm`). */
-export function isDWM(tf: string): boolean {
-    const spec = parseTimeframe(tf);
-    return spec !== null && (spec.unit === 'D' || spec.unit === 'W' || spec.unit === 'M');
+function firstMondayOfYear(year: number): number {
+    const jan1 = Date.UTC(year, 0, 1);
+    const weekday = new Date(jan1).getUTCDay();
+    return jan1 + ((8 - weekday) % 7) * DAY_MS;
 }
 
 /**
- * Compare two timeframes by duration. Negative when `a` is shorter than `b`.
- *
- * This replaces comparing positions in a hard-coded ordered list, which could only ever
- * order the timeframes somebody had remembered to put in the list.
+ * Open time of the bar of `tf` that contains `timestamp` (UTC calendar, as TradingView
+ * builds bars for a UTC 24/7 symbol). Every grid restarts at a calendar boundary, so the
+ * bar before a restart is shorter:
+ * - seconds / minutes: every N from 00:00 of the day;
+ * - ND: every N days from January 1;
+ * - NW: every N weeks from the first Monday of the year;
+ * - NM: every N months from January.
  */
-export function compareTimeframes(a: string, b: string): number {
-    return timeframeToSeconds(a) - timeframeToSeconds(b);
+export function timeframeBarStart(timestamp: number, tf: ParsedTimeframe): number {
+    const n = tf.multiplier;
+    const d = new Date(timestamp);
+    const year = d.getUTCFullYear();
+    switch (tf.unit) {
+        case 'S':
+        case '': {
+            const stepMs = timeframeSeconds(tf) * 1000;
+            const dayStart = Math.floor(timestamp / DAY_MS) * DAY_MS;
+            return dayStart + Math.floor((timestamp - dayStart) / stepMs) * stepMs;
+        }
+        case 'D': {
+            const yearStart = Date.UTC(year, 0, 1);
+            const day = Math.floor((timestamp - yearStart) / DAY_MS);
+            return yearStart + Math.floor(day / n) * n * DAY_MS;
+        }
+        case 'W': {
+            const dayStart = Math.floor(timestamp / DAY_MS) * DAY_MS;
+            const monday = dayStart - ((d.getUTCDay() + 6) % 7) * DAY_MS;
+            const firstMonday = firstMondayOfYear(new Date(monday).getUTCFullYear());
+            const week = Math.round((monday - firstMonday) / WEEK_MS);
+            return firstMonday + Math.floor(week / n) * n * WEEK_MS;
+        }
+        case 'M':
+            return Date.UTC(year, Math.floor(d.getUTCMonth() / n) * n, 1);
+    }
+}
+
+/** Close time of the bar of `tf` that opens at `barStart` (see {@link timeframeBarStart}). */
+export function timeframeBarEnd(barStart: number, tf: ParsedTimeframe): number {
+    const n = tf.multiplier;
+    const d = new Date(barStart);
+    const year = d.getUTCFullYear();
+    switch (tf.unit) {
+        case 'S':
+        case '': {
+            const dayEnd = (Math.floor(barStart / DAY_MS) + 1) * DAY_MS;
+            return Math.min(barStart + timeframeSeconds(tf) * 1000, dayEnd);
+        }
+        case 'D':
+            return Math.min(barStart + n * DAY_MS, Date.UTC(year + 1, 0, 1));
+        case 'W':
+            return Math.min(barStart + n * WEEK_MS, firstMondayOfYear(year + 1));
+        case 'M':
+            return Math.min(Date.UTC(year, d.getUTCMonth() + n, 1), Date.UTC(year + 1, 0, 1));
+    }
 }

@@ -2,8 +2,8 @@
 
 import { PineTS } from '../../../PineTS.class';
 import { Series } from '../../../Series';
-import { isValidTimeframe, normalizeTimeframe } from '../utils/TIMEFRAMES';
-import { timeframeToSeconds } from '../../../timeframe';
+import { formatTimeframe, parseTimeframe, timeframeSeconds } from '../../../timeframe';
+import { plainTickerId } from '../../../tickerModifier';
 import { PineArrayObject, PineArrayType } from '../../array/PineArrayObject';
 import { PineTypeObject } from '../../PineTypeObject';
 import { parseArgsForPineParams } from '../../utils';
@@ -292,7 +292,9 @@ export function security_lower_tf(context: any) {
         // ticker. THE CHART TYPE IS THE TICKER: on a non-standard chart it already carries the
         // ";heikinashi" modifier, which rides through to the data source (PineTS' own providers
         // strip it at their boundary).
-        const resolvedSymbol = rawSymbol === '' ? context.tickerId : rawSymbol;
+        // An encoded tickerid (ticker.new / ticker.modify with a session or adjustment) is requested
+        // as its symbol.
+        const resolvedSymbol = plainTickerId(rawSymbol === '' ? context.tickerId : rawSymbol);
         const _symbol = typeof resolvedSymbol === 'string' && resolvedSymbol.includes(':') ? resolvedSymbol.split(':')[1] : resolvedSymbol;
         const rawTimeframe = timeframeSlot instanceof Series ? timeframeSlot.get(0) : timeframeSlot;
         // Empty string "" means "use chart's timeframe" (Pine Script spec)
@@ -319,22 +321,22 @@ export function security_lower_tf(context: any) {
             }
         }
 
-        // Duration-based ordering — see the matching note in security.ts.
-        const ctxTimeframeSec = timeframeToSeconds(normalizeTimeframe(context.timeframe));
-        const reqTimeframeSec = timeframeToSeconds(normalizeTimeframe(_timeframe));
+        const ctxTimeframe = parseTimeframe(context.timeframe);
+        const reqTimeframe = parseTimeframe(_timeframe);
 
-        if (!isValidTimeframe(normalizeTimeframe(context.timeframe)) ||
-            !isValidTimeframe(normalizeTimeframe(_timeframe))) {
+        if (!ctxTimeframe || !reqTimeframe) {
             if (_ignore_invalid_timeframe) return NaN;
-            throw new Error('Invalid timeframe');
+            throw new Error(`Invalid value of the 'timeframe' argument ('${reqTimeframe ? context.timeframe : _timeframe}') in the 'security_lower_tf' function.`);
         }
+        const ctxSeconds = timeframeSeconds(ctxTimeframe);
+        const reqSeconds = timeframeSeconds(reqTimeframe);
 
-        if (reqTimeframeSec > ctxTimeframeSec) {
+        if (reqSeconds > ctxSeconds) {
             if (_ignore_invalid_timeframe) return NaN;
             throw new Error(`Timeframe ${_timeframe} is not lower than or equal to chart timeframe ${context.timeframe}`);
         }
 
-        if (reqTimeframeSec === ctxTimeframeSec) {
+        if (formatTimeframe(reqTimeframe) === formatTimeframe(ctxTimeframe)) {
             if (Array.isArray(_expression)) {
                 // Tuple: each element becomes a 1-element PineArrayObject
                 const arrays = _expression.map((v: any) =>

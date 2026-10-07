@@ -1,22 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-import { canonicalizeTimeframe } from '../timeframe';
-
 import { IProvider, ISymbolInfo, BaseProviderConfig } from './IProvider';
 import { Kline, normalizeCloseTime } from './types';
-import { selectSubTimeframe, aggregateCandles, getAggregationRatio } from './aggregation';
+import { selectSubTimeframe, aggregateCandles, getAggregationRatio, getApproximateRatio } from './aggregation';
 import { stripTickerModifier } from '../tickerModifier';
+import { canonicalTimeframe, parseTimeframe, timeframeBarStart } from '../timeframe';
 
 /**
  * Normalize a user-supplied timeframe key to the canonical form used
- * by `getSupportedTimeframes()` and the shared parser in `src/timeframe.ts`.
- *
- * Canonical forms: seconds as 'NS', minutes as plain integers,
- * calendar periods as D/W/M.
+ * by `getSupportedTimeframes()`: seconds as 'NS', minutes as plain integers,
+ * calendar periods as D/W/M with an optional multiplier ('2D', '12M').
  */
-
 function normalizeTimeframeKey(timeframe: string): string {
-    return canonicalizeTimeframe(timeframe);
+    return canonicalTimeframe(timeframe) ?? timeframe;
 }
 
 /**
@@ -121,6 +117,14 @@ export abstract class BaseProvider<TConfig extends BaseProviderConfig = BaseProv
         ]);
     }
 
+    /**
+     * Whether aggregated bars follow TradingView's UTC calendar grid (see `aggregateCandles`).
+     * Override to return true in providers of UTC 24/7 markets.
+     */
+    protected aggregatesOnCalendarGrid(): boolean {
+        return false;
+    }
+
     // ── Market data orchestrator ────────────────────────────────────────
 
     /**
@@ -165,15 +169,20 @@ export abstract class BaseProvider<TConfig extends BaseProviderConfig = BaseProv
         // Inflate limit to account for aggregation ratio
         const subLimit = this._computeSubLimit(normalizedTf, subTimeframe, limit);
 
+        // Start at the open of the bar that contains sDate, so the first bar is complete.
+        const calendarGrid = this.aggregatesOnCalendarGrid();
+        const target = parseTimeframe(normalizedTf);
+        const subSDate = calendarGrid && sDate !== undefined && target ? timeframeBarStart(sDate, target) : sDate;
+
         // Fetch sub-candles
         const subCandles = await this._getMarketDataNative(
-            tickerId, subTimeframe, subLimit, sDate, eDate,
+            tickerId, subTimeframe, subLimit, subSDate, eDate,
         );
 
         if (subCandles.length === 0) return [];
 
         // Aggregate
-        const aggregated = aggregateCandles(subCandles, normalizedTf, subTimeframe);
+        const aggregated = aggregateCandles(subCandles, normalizedTf, subTimeframe, { calendarGrid });
 
         // Apply limit to the aggregated result
         if (limit && limit > 0 && aggregated.length > limit) {
@@ -216,10 +225,9 @@ export abstract class BaseProvider<TConfig extends BaseProviderConfig = BaseProv
 
         const ratio = getAggregationRatio(targetTf, subTf);
         if (ratio === Infinity) {
-            // Calendar-based: generous estimate
-            if (targetTf === 'W') return limit * 7 + 14;
-            if (targetTf === 'M') return limit * 31 + 31;
-            return limit * 30;
+            // Calendar-based: average length plus two bars of buffer
+            const average = getApproximateRatio(targetTf, subTf);
+            return Math.ceil(limit * average) + 2 * Math.ceil(average);
         }
 
         // Fixed ratio + small buffer for alignment edge cases
