@@ -729,6 +729,11 @@ export function runAnalysisPass(ast: any, scopeManager: ScopeManager): string | 
                             {
                                 type: 'VariableDeclarator',
                                 id: element,
+                                // Read by StatementTransformer: this declarator, and only this
+                                // one, reads its value out of the tuple temp. The name alone
+                                // cannot say so - the name set is global, and `float h0 = high[0]`
+                                // in another function has the same `x[0]` shape.
+                                _arrayPatternElement: true,
                                 init: {
                                     type: 'MemberExpression',
                                     object: {

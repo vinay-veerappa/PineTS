@@ -344,12 +344,13 @@ export function transformVariableDeclaration(varNode: any, scopeManager: ScopeMa
         const newName = scopeManager.addVariable(decl.id.name, varNode.kind);
         const kind = varNode.kind; // 'const', 'let', or 'var'
 
-        // Only treat as an array pattern variable when it actually has the destructured
-        // MemberExpression shape (e.g. _tmp_0[0]) from the AnalysisPass rewrite.
-        // The arrayPatternElements set is global (not scoped), so a same-named variable
-        // inside a function body may be falsely flagged — guard with a shape check.
+        // Only the declarators the AnalysisPass tuple rewrite created (marked there).
+        // The arrayPatternElements set is global (not scoped) and the old shape guard
+        // (a computed MemberExpression init) also matched Pine's own `high[0]`: with
+        // `[h0, t0] = f()` anywhere in a script, `float h0 = high[0]` in any other
+        // function compiled to `$.get($.let.high, 0)[0]` and threw on its first bar.
         const isArrayPatternVar =
-            scopeManager.isArrayPatternElement(decl.id.name) &&
+            decl._arrayPatternElement === true &&
             decl.init &&
             decl.init.type === 'MemberExpression' &&
             decl.init.computed;

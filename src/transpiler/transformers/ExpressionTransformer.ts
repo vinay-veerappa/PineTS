@@ -2337,13 +2337,20 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
         const isFieldReceiver =
             (calleeObj?.type === 'MemberExpression' && !calleeObj.computed && calleeObj.property?.type === 'Identifier') || isUserCallResult;
         const isFieldDelete = !node.callee.computed && node.callee.property?.name === 'delete' && isFieldReceiver;
+        // Case 4 — Call result: $.get(X, N).arr?.get?.(0).method()
+        //   callee.object is an intermediate call that an earlier visit already optional-chained
+        //   (Case 1 or 2), so its result is an array element or field value that can be na: an
+        //   `array<label>` filled by `label.new` holds na in a request.security secondary context
+        //   (@silentInSecondary). Keyed on the receiver call being optional already, so the
+        //   leaf-only rule above still holds: this never wraps the intermediate call itself.
+        const isGetCallResult = calleeObj?.type === 'CallExpression' && calleeObj.optional === true && hasGetCallInChain(calleeObj);
         // Getters and setters of a drawing that is na (an unset UDT field, `box b = na`) return na
         // ("" for get_text) and do nothing on TradingView: the receiver goes through
         // `$.drawingOrNa`, which stands in for an na drawing.
         const isDrawingAccessor =
             !node.callee.computed &&
             /^(get|set)_\w+$/.test(node.callee.property?.name ?? '') &&
-            (isDirect || isChained || isFieldReceiver);
+            (isDirect || isChained || isGetCallResult || isFieldReceiver);
         if (isDrawingAccessor) {
             node.callee.object = {
                 type: 'CallExpression',
@@ -2353,7 +2360,7 @@ function transformCallExpressionInner(node: any, scopeManager: ScopeManager, nam
             };
         }
 
-        if (isDirect || isChained || isFieldDelete) {
+        if (isDirect || isChained || isGetCallResult || isFieldDelete) {
             // Double optional chaining: obj?.method?.()
             // The node stays as a CallExpression (safe for AST walkers) but gets:
             //   1. optional: true on the CallExpression  → produces ?.()
