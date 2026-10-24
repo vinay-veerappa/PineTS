@@ -267,7 +267,7 @@ function udtFieldHistory(chain: any, baseName: string, baseRef: any, index: any,
     const paramCall = {
         type: 'CallExpression',
         callee: ASTFactory.createMemberExpression(ASTFactory.createContextIdentifier(), ASTFactory.createIdentifier('param')),
-        arguments: [chain, UNDEFINED_ARG, makeParamNameArg(scopeManager, paramId)],
+        arguments: [chain, createUndefinedArg(), makeParamNameArg(scopeManager, paramId)],
         _transformed: true,
         _isParamCall: true,
     };
