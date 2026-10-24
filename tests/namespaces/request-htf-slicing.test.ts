@@ -168,4 +168,65 @@ plot(htf, "htf")
         const secTranspiled = (cached.pineTS as any).transpiledCode;
         expect(secTranspiled).toBe(sliceFn);
     });
+
+    // Every call site of the function reads its value back under its own name
+    // (`<call-site id>` + `pN`), so the slice must run all of them.
+    it('Phase 3 slice runs every top-level call site of the function', () => {
+        const code = `
+//@version=6
+indicator("fn sites")
+f(simple string tf) => request.security(syminfo.tickerid, tf, close)
+a = f("240")
+b = f("D")
+plot(a + b, "sum")
+`;
+        const fn = transpile(code) as any;
+        const src = (Object.values(fn._ltfSlices ?? {})[0] as Function).toString();
+        expect(src.match(/\$\.call\(f,/g)?.length).toBe(2);
+        expect(src).not.toMatch(/'sum'/);
+    });
+
+    it('runtime: a function called from several sites returns each site its own request', async () => {
+        const pineTS = new PineTS(Provider.Mock, 'BTCUSDC', '60', null, Date.UTC(2024, 0, 1), Date.UTC(2024, 0, 10));
+        const { plots } = await pineTS.run(`//@version=6
+indicator("fn sites runtime")
+f(simple string tf) => request.security(syminfo.tickerid, tf, close)
+a = f("240")
+b = f("D")
+c = f("240")
+plot(a, "a")
+plot(b, "b")
+plot(c, "c")
+plot(request.security(syminfo.tickerid, "240", close), "a0")
+plot(request.security(syminfo.tickerid, "D", close), "b0")`);
+        const v = (t: string) => plots[t].data.map((d: any) => d.value);
+        const [a, b, c, a0, b0] = ['a', 'b', 'c', 'a0', 'b0'].map(v);
+        expect(a.filter((x: any) => Number.isFinite(x)).length).toBeGreaterThan(100);
+        expect(b.filter((x: any) => Number.isFinite(x)).length).toBeGreaterThan(100);
+        expect(a).toEqual(a0);
+        expect(c).toEqual(a0);
+        expect(b).toEqual(b0);
+        expect(a).not.toEqual(b);
+    });
+
+    it('runtime: the same for request.security_lower_tf', async () => {
+        const pineTS = new PineTS(Provider.Mock, 'BTCUSDC', 'D', null, Date.UTC(2024, 0, 1), Date.UTC(2024, 0, 20));
+        const { plots } = await pineTS.run(`//@version=6
+indicator("ltf fn sites")
+f(simple string tf) => request.security_lower_tf(syminfo.tickerid, tf, close)
+a = f("60")
+b = f("240")
+plot(a.size(), "a")
+plot(b.size(), "b")
+plot(a.last(), "al")
+plot(b.last(), "bl")
+plot(request.security_lower_tf(syminfo.tickerid, "60", close).last(), "al0")
+plot(request.security_lower_tf(syminfo.tickerid, "240", close).last(), "bl0")`);
+        const v = (t: string) => plots[t].data.map((d: any) => d.value);
+        const [a, b, al, bl, al0, bl0] = ['a', 'b', 'al', 'bl', 'al0', 'bl0'].map(v);
+        expect(a.at(-1)).toBe(24);
+        expect(b.at(-1)).toBe(6);
+        expect(al).toEqual(al0);
+        expect(bl).toEqual(bl0);
+    });
 });

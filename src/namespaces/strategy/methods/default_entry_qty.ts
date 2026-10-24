@@ -15,6 +15,9 @@ export function default_entry_qty(context: any) {
         if (!context.strategy) return 0;
         // direction=1 (long) is arbitrary — calculateOrderQty's percent-of-equity
         // / cash branches don't depend on direction sign.
-        return calculateOrderQty(context, undefined, 1, fillPrice);
+        // A negative fill price gives a negative quantity, the signed price staying in the formula
+        // (TradingView, CL1! 1D, 10% of 1,000,000 with 3 per contract: fill −1 → 100,000 /
+        // (−1,000 + 3) → −100; BTCUSDT: 10,000 / −63,075.43 → −0.15854).
+        return calculateOrderQty(context, undefined, 1, fillPrice, false, true);
     };
 }

@@ -3,6 +3,7 @@
 
 import { Order } from '../types';
 import { parseArgsForPineParams } from '../../utils';
+import { argValue } from '../utils';
 
 /**
  * Cancel pending orders by id.
@@ -21,7 +22,7 @@ export function cancel(context: any) {
             throw new Error('strategy.cancel() called before strategy() declaration');
         }
         const parsed = parseArgsForPineParams<any>(args, CANCEL_SIGNATURES, CANCEL_ARGS_TYPES);
-        const targetId = parsed.id;
+        const targetId = argValue(parsed.id);
         if (targetId === undefined || targetId === null) return;
 
         context.strategy.pending_orders = context.strategy.pending_orders.filter(

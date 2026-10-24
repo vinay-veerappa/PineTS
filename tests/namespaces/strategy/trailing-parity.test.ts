@@ -56,8 +56,7 @@ function createTrailingContext({
                 from_entry: 'buy',
                 trail_points: 10,
                 trail_offset: 5,
-                trail_peak: 110,
-                trail_armed: true,
+                _trailByTrade: { trade_1: { armed: true, peak: 110 } },
                 status: 'pending',
                 bar: 0,
                 time: 0,
@@ -119,7 +118,7 @@ describe('Strategy - Trailing Stop Price Path Parity', () => {
         processExitOrders(context);
 
         expect(order.status).toBe('pending');
-        expect(order.trail_peak).toBe(120);
+        expect(order._trailByTrade?.trade_1.peak).toBe(120);
         expect(strategy.closedtrades).toHaveLength(0);
     });
 
@@ -135,7 +134,7 @@ describe('Strategy - Trailing Stop Price Path Parity', () => {
 
         expect(order.status).toBe('filled');
         expect(order.fill_price).toBe(115);
-        expect(order.trail_peak).toBe(120);
+        expect(order._trailByTrade?.trade_1.peak).toBe(120);
         expect(strategy.closedtrades).toHaveLength(1);
         expect(strategy.closedtrades[0].exit_price).toBe(115);
     });
@@ -152,7 +151,7 @@ describe('Strategy - Trailing Stop Price Path Parity', () => {
 
         expect(order.status).toBe('filled');
         expect(order.fill_price).toBe(115);
-        expect(order.trail_peak).toBe(120);
+        expect(order._trailByTrade?.trade_1.peak).toBe(120);
         expect(strategy.closedtrades).toHaveLength(1);
         expect(strategy.closedtrades[0].exit_price).toBe(115);
     });

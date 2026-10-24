@@ -54,8 +54,9 @@ export function kcw(context: any) {
         // Helper to update EMA state
         const updateEma = (committedState: any, tentativeState: any, value: number, period: number) => {
             if (isNaN(value)) {
+                // As ta.ema: na on the na bar, the state carried to the next one
                 Object.assign(tentativeState, committedState);
-                return tentativeState.prevEma !== null ? tentativeState.prevEma : NaN;
+                return NaN;
             }
 
             let initCount = committedState.initCount;

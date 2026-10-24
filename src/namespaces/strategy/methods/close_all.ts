@@ -4,6 +4,7 @@
 import { Order } from '../types';
 import { Series } from '../../../Series';
 import { parseArgsForPineParams } from '../../utils';
+import { argValue } from '../utils';
 
 /**
  * Close ALL open positions at market, regardless of which entry opened them.
@@ -79,10 +80,10 @@ export function close_all(context: any) {
             status: 'pending',
             category: 'exit',
             from_entry: '', // empty == match-all (within the snapshot)
-            comment: parsed.comment,
-            alert_message: parsed.alert_message,
-            immediately: parsed.immediately === true,
-            disable_alert: parsed.disable_alert,
+            comment: argValue(parsed.comment),
+            alert_message: argValue(parsed.alert_message),
+            immediately: argValue(parsed.immediately) === true,
+            disable_alert: argValue(parsed.disable_alert),
             _intended_trade_ids: context.strategy.opentrades.map((t: any) => t.id),
         };
         context.strategy.pending_orders.push(order);

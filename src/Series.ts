@@ -1,6 +1,8 @@
 export class Series {
     /** Value of a read before the first bar: na, or `false` for a Pine v6 bool series (v6 bools are never na). */
     public beforeStart: any = NaN;
+    /** Storage of a `varip` variable: re-executions of a bar do not roll its value back. */
+    public varip?: boolean;
 
     constructor(public data: any[], public offset: number = 0) { }
 

@@ -6,9 +6,13 @@ import { splitTickerModifier, withTickerModifier } from './tickerModifier';
 import { createSyminfo } from './namespaces/Syminfo';
 import { Series } from './Series';
 import { Indicator } from './Indicator';
-import { processStrategyOrders, processOrdersOnClose, processExitOrders, processMarginCall, finalizeStrategyBar, finalizeStrategyRun, isAdverseFirstBar, applyPendingCloseMarginCall, snapshotStrategyState, restoreStrategyState } from './namespaces/strategy/utils';
+import { toImportResolver } from './imports/Function/FunctionImportResolver.class';
+import type { IImportResolver, ImportResolverFn } from './imports/IImportResolver';
+import { processBarOrders, barPath, beginStrategyBar, riskStartBar, riskAtBarClose, processOrdersOnClose, processMarginCall, finalizeStrategyBar, finalizeStrategyRun, applyPendingCloseMarginCall, snapshotStrategyState, restoreStrategyState, snapToTick } from './namespaces/strategy/utils';
 
 import { parseTimeframe, timeframeSeconds } from './timeframe';
+
+type OHLC = { open: number; high: number; low: number; close: number };
 
 function getTimeframeDurationMs(timeframe: string | undefined): number {
     const tf = parseTimeframe(timeframe);
@@ -64,8 +68,13 @@ export class PineTS {
     private _currentIndicator: Indicator | null = null;
 
     private _isSecondaryContext: boolean = false;
-    public markAsSecondary() {
+    /**
+     * Mark this instance as the secondary context of a `request.*` call.
+     * It inherits what its parent runs with: the import resolver.
+     */
+    public markAsSecondary(parent?: Context) {
         this._isSecondaryContext = true;
+        if (parent) this._importResolver = parent.importResolver;
     }
 
     private _syminfo: ISymbolInfo;
@@ -94,6 +103,21 @@ export class PineTS {
         this._maxLoops = maxLoops;
     }
 
+    private _fillsOnTickGrid: boolean = true;
+
+    /**
+     * Whether the strategy broker trades on the symbol's tick grid (default: true).
+     * Split / dividend adjusted feeds (US equities) carry prices between ticks, e.g. AAPL
+     * 40.8125 with a 0.01 tick. TradingView's broker moves every bar price to the nearest tick
+     * (40.81) before using it for fills, order triggers, trailing stops, margin checks and
+     * sizing, while the script keeps seeing the raw prices. Prices already on the grid are
+     * unaffected. Disable to have the broker use the raw feed prices.
+     * @param enabled Snap broker prices to the tick grid
+     */
+    public setFillsOnTickGrid(enabled: boolean) {
+        this._fillsOnTickGrid = enabled;
+    }
+
     private _alertMode: 'realtime' | 'all' = 'realtime';
 
     /**
@@ -105,6 +129,21 @@ export class PineTS {
      */
     public setAlertMode(mode: 'realtime' | 'all') {
         this._alertMode = mode;
+    }
+
+    private _importResolver: IImportResolver | null = null;
+
+    /**
+     * Set where the libraries of `import <user>/<library>/<version> [as alias]`
+     * statements come from: an import resolver (`ImportResolver.GitHub`,
+     * `new FileImportResolver({ dir })`, ...), or a plain function
+     * `(path, info) => source | null`, which is wrapped in a `FunctionImportResolver`.
+     * Resolvers cache what they resolve, so a library is fetched once per
+     * resolver, across runs and `request.security` contexts.
+     * @param resolver An import resolver or function; `null` removes it
+     */
+    public setImportResolver(resolver: IImportResolver | ImportResolverFn | null) {
+        this._importResolver = resolver == null ? null : toImportResolver(resolver);
     }
 
     // ── Visible-range / host environment ────────────────────────────────
@@ -211,62 +250,59 @@ export class PineTS {
         private sDate?: number,
         private eDate?: number,
     ) {
-        this._readyPromise = new Promise((resolve) => {
-            this.loadMarketData(source, tickerId, timeframe, limit, sDate, eDate).then((data) => {
-                const marketData = data;
+        this._readyPromise = this._loadData(source, tickerId, timeframe, limit, sDate, eDate);
+        // A failed load rejects ready(), and through it run() / stream(). Until
+        // one of those awaits it nobody handles the rejection, so mark it
+        // handled here (a PineTS that is built and never run must not raise an
+        // unhandled rejection); awaiting _readyPromise still rejects.
+        this._readyPromise.catch(() => {});
+    }
 
-                //this._periods = marketData.length;
-                this.data = marketData;
+    private async _loadData(source: IProvider | any[], tickerId?: string, timeframe?: string, limit?: number, sDate?: number, eDate?: number) {
+        const marketData = await this.loadMarketData(source, tickerId, timeframe, limit, sDate, eDate);
 
-                const _open = marketData.map((d) => d.open);
-                const _close = marketData.map((d) => d.close);
-                const _high = marketData.map((d) => d.high);
-                const _low = marketData.map((d) => d.low);
-                const _volume = marketData.map((d) => d.volume);
-                const _hlc3 = marketData.map((d) => (d.high + d.low + d.close) / 3);
-                const _hl2 = marketData.map((d) => (d.high + d.low) / 2);
-                const _ohlc4 = marketData.map((d) => (d.high + d.low + d.open + d.close) / 4);
-                const _hlcc4 = marketData.map((d) => (d.high + d.low + d.close + d.close) / 4);
-                const _openTime = marketData.map((d) => d.openTime);
-                // Providers should supply closeTime as session close time (TV convention).
-                // Safety-net for array-based data or providers that omit closeTime:
-                // estimate as openTime + timeframe duration (accurate for 24/7 crypto).
-                const tfDurationMs = getTimeframeDurationMs(this.timeframe);
-                const _closeTime = marketData.map((d) =>
-                    d.closeTime != null ? d.closeTime : d.openTime + tfDurationMs
-                );
+        //this._periods = marketData.length;
+        this.data = marketData;
 
-                this.open = _open;
-                this.close = _close;
-                this.high = _high;
-                this.low = _low;
-                this.volume = _volume;
-                this.hl2 = _hl2;
-                this.hlc3 = _hlc3;
-                this.ohlc4 = _ohlc4;
-                this.hlcc4 = _hlcc4;
-                this.openTime = _openTime;
-                this.closeTime = _closeTime;
+        const _open = marketData.map((d) => d.open);
+        const _close = marketData.map((d) => d.close);
+        const _high = marketData.map((d) => d.high);
+        const _low = marketData.map((d) => d.low);
+        const _volume = marketData.map((d) => d.volume);
+        const _hlc3 = marketData.map((d) => (d.high + d.low + d.close) / 3);
+        const _hl2 = marketData.map((d) => (d.high + d.low) / 2);
+        const _ohlc4 = marketData.map((d) => (d.high + d.low + d.open + d.close) / 4);
+        const _hlcc4 = marketData.map((d) => (d.high + d.low + d.close + d.close) / 4);
+        const _openTime = marketData.map((d) => d.openTime);
+        // Providers should supply closeTime as session close time (TV convention).
+        // Safety-net for array-based data or providers that omit closeTime:
+        // estimate as openTime + timeframe duration (accurate for 24/7 crypto).
+        const tfDurationMs = getTimeframeDurationMs(this.timeframe);
+        const _closeTime = marketData.map((d) =>
+            d.closeTime != null ? d.closeTime : d.openTime + tfDurationMs
+        );
 
-                if (source && (source as IProvider).getSymbolInfo) {
-                    const symbolInfo = (source as IProvider)
-                        .getSymbolInfo(tickerId)
-                        .then((symbolInfo) => {
-                            this._syminfo = symbolInfo;
-                            this._ready = true;
-                            resolve(true);
-                        })
-                        .catch((error) => {
-                            console.warn('Failed to get symbol info, using default values:', error);
-                            this._ready = true;
-                            resolve(true);
-                        });
-                } else {
-                    this._ready = true;
-                    resolve(true);
-                }
-            });
-        });
+        this.open = _open;
+        this.close = _close;
+        this.high = _high;
+        this.low = _low;
+        this.volume = _volume;
+        this.hl2 = _hl2;
+        this.hlc3 = _hlc3;
+        this.ohlc4 = _ohlc4;
+        this.hlcc4 = _hlcc4;
+        this.openTime = _openTime;
+        this.closeTime = _closeTime;
+
+        if (source && (source as IProvider).getSymbolInfo) {
+            try {
+                this._syminfo = await (source as IProvider).getSymbolInfo(tickerId);
+            } catch (error) {
+                console.warn('Failed to get symbol info, using default values:', error);
+            }
+        }
+        this._ready = true;
+        return true;
     }
 
     public setDebugSettings({ ln, debug }: { ln: boolean; debug: boolean }) {
@@ -452,6 +488,7 @@ export class PineTS {
         const context = this._initializeContext(null as any, inputs, this._isSecondaryContext);
         context.pineVersion = (transpiledFn as any)._pineVersion ?? null;
         this._transpiledCode = transpiledFn;
+        context.transpiledFn = transpiledFn;
         // Preserve slice attribution on the context so any nested LTF
         // request inside the slice can keep using the same map.
         const slices = (transpiledFn as any)._ltfSlices;
@@ -476,12 +513,14 @@ export class PineTS {
         await this.ready();
         if (!periods) periods = this.data.length;
 
+        await ind.resolveImports(this._importResolver);
         const prepared = ind.prepare(this._debugSettings);
         this._usesVisibleRange = prepared.usesVisibleRange;
 
         const context = this._initializeContext(ind.source ?? null as any, prepared.inputs, this._isSecondaryContext);
         context.pineVersion = (prepared.fn as any)._pineVersion ?? null;
         this._transpiledCode = prepared.fn;
+        context.transpiledFn = prepared.fn;
         // Propagate transpile-time slices (one per request.security_lower_tf
         // call site) onto the Context so the slow path of the LTF runtime
         // can pick the right truncated body to run in the secondary
@@ -522,12 +561,14 @@ export class PineTS {
         await this.ready();
         if (!periods) periods = this.data.length;
 
+        await ind.resolveImports(this._importResolver);
         const prepared = ind.prepare(this._debugSettings);
         this._usesVisibleRange = prepared.usesVisibleRange;
 
         const context = this._initializeContext(ind.source ?? null as any, prepared.inputs, this._isSecondaryContext);
         context.pineVersion = (prepared.fn as any)._pineVersion ?? null;
         this._transpiledCode = prepared.fn;
+        context.transpiledFn = prepared.fn;
         if (prepared.ltfSlices) (context as any)._ltfTruncatedBodies = prepared.ltfSlices;
 
         const startIdx = this.data.length - periods;
@@ -1035,8 +1076,9 @@ export class PineTS {
                         if (item.data.length > snapInfo.len) {
                             item.data.length = snapInfo.len;
                         }
-                        // Restore the last value (which may have been modified in-place)
-                        if (snapInfo.len > 0 && snapInfo.lastVal !== undefined) {
+                        // Restore the last value (which may have been modified in-place).
+                        // A `varip` keeps the value the discarded execution left in it.
+                        if (snapInfo.len > 0 && snapInfo.lastVal !== undefined && !item.varip) {
                             item.data[snapInfo.len - 1] = snapInfo.lastVal;
                         }
                     }
@@ -1105,6 +1147,8 @@ export class PineTS {
 
         context.__maxLoops = this._maxLoops;
         context._alertMode = this._alertMode;
+        context._fillsOnTickGrid = this._fillsOnTickGrid;
+        context.importResolver = this._importResolver;
 
         // User-explicit prop overrides flow from the Indicator to the runtime.
         // Read by Core.indicator() and initializeStrategy/strategy.any() to
@@ -1128,6 +1172,106 @@ export class PineTS {
         context.length = this.data.length;
 
         return context;
+    }
+
+    /**
+     * The broker's fills on a bar of a `calc_on_order_fills` strategy (TradingView, historical bars):
+     *   - the bar is walked point by point along its path (open, nearer extreme, farther extreme,
+     *     close); a fill between two points belongs to the later one;
+     *   - after the points with fills (other than the close) the script runs again, on the complete
+     *     bar, with the broker state at that point. Its orders work from that point on: a market order
+     *     fills at that point's price, limit / stop / exit legs on the rest of the path. Its plots,
+     *     drawings and variables are discarded (`var` is rolled back);
+     *   - the run after a fill at the close is the bar's normal run, which follows this method.
+     * Each path segment is given to the broker as a bar of its own, opening at the segment's start.
+     * @private
+     */
+    private async _processBarWithOrderFills(context: Context, transpiledFn: Function, rawBar: OHLC | null): Promise<void> {
+        const strategy: any = context.strategy;
+        const d: any = context.data;
+        const last = d.close.data.length - 1;
+        const real = { open: d.open.data[last], high: d.high.data[last], low: d.low.data[last], close: d.close.data[last] };
+        // The script sees the raw bar; the broker its tick-grid copy (see _snapBarForBroker).
+        const scriptBar = rawBar ?? real;
+        const setBar = (open: number, high: number, low: number, close: number) => {
+            d.open.data[last] = open;
+            d.high.data[last] = high;
+            d.low.data[last] = low;
+            d.close.data[last] = close;
+        };
+        const path = barPath(real.open, real.high, real.low, real.close);
+        let snapshot: any = null;
+
+        for (let k = 0; k < path.length; k++) {
+            const from = k === 0 ? path[0] : path[k - 1];
+            const to = path[k];
+            setBar(from, Math.max(from, to), Math.min(from, to), to);
+            const fills = strategy._fillCount ?? 0;
+            // Positions on the segment map onto the whole bar's path (excursions).
+            (context as any)._excSeg = k === 0 ? { offset: 0, scale: 0 } : { offset: k - 1, scale: 1 / 3 };
+            processBarOrders(context);
+            (context as any)._excSeg = undefined;
+            // A trade entered inside this segment starts its exit path there; later segments are whole.
+            for (const t of strategy.opentrades) if (t._intrabarEntry?.bar === context.idx) t._intrabarEntry = undefined;
+            if (k === path.length - 1 || (strategy._fillCount ?? 0) === fills) continue;
+
+            setBar(scriptBar.open, scriptBar.high, scriptBar.low, scriptBar.close);
+            if (!snapshot) {
+                snapshot = this._snapshotVarState(context);
+                snapshot.strategy = null;
+            }
+            const plotLengths = new Map<string, number>(Object.entries(context.plots ?? {}).map(([key, p]: [string, any]) => [key, p?.data?.length ?? 0]));
+            const pending = new Set(strategy.pending_orders);
+            context._execTick = (context._execTick || 0) + 1;
+            // The market is at this point of the bar: order levels snap to the tick grid away from it.
+            (context as any)._fillPointPrice = to;
+            await transpiledFn(context);
+            (context as any)._fillPointPrice = undefined;
+            // Orders placed now work from this point of the bar on.
+            for (const o of strategy.pending_orders) if (!pending.has(o) && o.bar === context.idx) o.bar = context.idx - 1;
+            for (const key of Object.keys(context.plots ?? {})) {
+                const len = plotLengths.get(key);
+                if (len === undefined) delete context.plots[key];
+                else if (context.plots[key]?.data?.length > len) context.plots[key].data.length = len;
+            }
+            context.rollbackDrawings(context.idx);
+            this._restoreVarState(context, snapshot);
+        }
+        setBar(real.open, real.high, real.low, real.close);
+        if (snapshot) context._execTick = (context._execTick || 0) + 1;
+    }
+
+    /**
+     * Moves the current bar's prices onto the tick grid for the broker (see setFillsOnTickGrid).
+     * Returns the raw prices to restore before the script runs, or null when nothing moved.
+     * @private
+     */
+    private _snapBarForBroker(context: Context): OHLC | null {
+        if (!this._fillsOnTickGrid || !context.strategy) return null;
+        const mintick = context.pine?.syminfo?.mintick;
+        if (!mintick || mintick <= 0) return null;
+        const d: any = context.data;
+        const last = d.close.data.length - 1;
+        const raw = { open: d.open.data[last], high: d.high.data[last], low: d.low.data[last], close: d.close.data[last] };
+        const snapped = { open: snapToTick(raw.open, mintick), high: snapToTick(raw.high, mintick), low: snapToTick(raw.low, mintick), close: snapToTick(raw.close, mintick) };
+        if (snapped.open === raw.open && snapped.high === raw.high && snapped.low === raw.low && snapped.close === raw.close) return null;
+        this._setBar(context, snapped);
+        context._rawBar = raw;
+        return raw;
+    }
+
+    private _restoreRawBar(context: Context, raw: OHLC): void {
+        this._setBar(context, raw);
+        context._rawBar = undefined;
+    }
+
+    private _setBar(context: Context, bar: OHLC): void {
+        const d: any = context.data;
+        const last = d.close.data.length - 1;
+        d.open.data[last] = bar.open;
+        d.high.data[last] = bar.high;
+        d.low.data[last] = bar.low;
+        d.close.data[last] = bar.close;
     }
 
     /**
@@ -1172,32 +1316,35 @@ export class PineTS {
                 // a reversal queued at that close (qty frozen at queue
                 // time) overshoots by exactly the deferred quantity, as TV
                 // does.
+                const rawBar = this._snapBarForBroker(context);
+                beginStrategyBar(context);
+                riskStartBar(context);
                 applyPendingCloseMarginCall(context);
-                processStrategyOrders(context);
-                // Margin checkpoints along the intra-bar path (TV broker
-                // emulator): first at the OPEN right after entries fill;
-                // then at the adverse extreme — BEFORE exit fills when the
-                // bar's first move is adverse for the position (the
-                // extreme precedes the favorable exits on the path), AFTER
-                // them otherwise (favorable exits free margin first). The
-                // 'extreme' checkpoint may schedule a deferred second
-                // margin call at this bar's close (phantom re-check).
-                processMarginCall(context, 'open');
-                const adverseFirst = isAdverseFirstBar(context);
-                if (adverseFirst) processMarginCall(context, 'extreme');
-                processExitOrders(context, 'intrabar');
-                if (!adverseFirst) processMarginCall(context, 'extreme');
+                if (context.strategy.config?.calc_on_order_fills) await this._processBarWithOrderFills(context, transpiledFn, rawBar);
+                else processBarOrders(context);
                 // Latch max_drawdown / max_runup ONCE at the end of the bar so
                 // trades closed mid-bar by TP / SL contribute their realized
                 // P&L (not phantom intra-bar excursions against the raw H/L).
                 finalizeStrategyBar(context);
+                if (rawBar) this._restoreRawBar(context, rawBar);
             }
 
             const result = await transpiledFn(context);
 
             // Market orders placed on this bar that fill at its close
             // (process_orders_on_close, close(immediately = true)).
-            if (context.strategy) processOrdersOnClose(context);
+            // Margin checkpoint at the close, booked after the script saw the bar (TV: the bar's
+            // logged position excludes it) and before the orders filling at the close: a position
+            // opened at the close is first checked at the next open (TV, process_orders_on_close).
+            // A scheduled phantom close call takes its place.
+            if (context.strategy) {
+                const rawBar = this._snapBarForBroker(context);
+                riskAtBarClose(context);
+                if (!(context.strategy as any)._pending_close_mc) processMarginCall(context, 'close');
+                riskAtBarClose(context);
+                processOrdersOnClose(context);
+                if (rawBar) this._restoreRawBar(context, rawBar);
+            }
 
             //collect results
             if (typeof result === 'object') {

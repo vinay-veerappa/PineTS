@@ -2,6 +2,7 @@
 // Copyright (C) 2026 LuxAlgo
 
 import { Trade } from '../types';
+import { brokerPrice, openTradeList } from '../utils';
 
 /**
  * Pine's `strategy.opentrades` mirrors strategy.closedtrades' dual-role
@@ -15,13 +16,18 @@ export function opentrades(context: any) {
     return () => {
         // SNAPSHOT the open-trades list AT CALL TIME (see closedtrades.ts for
         // the rationale — per-bar plot values must capture per-bar state).
-        const live: Trade[] = context.strategy?.opentrades ?? [];
-        const list: Trade[] = live.slice();
-        const at = (i: any): Trade | undefined => list[Number(i)];
+        const list: Trade[] = openTradeList(context);
+        // `na` reads trade 0, as on TradingView.
+        const at = (i: any): Trade | undefined => {
+            const n = Number(i);
+            return list[Number.isNaN(n) ? 0 : n];
+        };
+        // The close as the broker trades it (on the tick grid), as strategy.openprofit: TradingView,
+        // AAPL 1D, close 126.655 → (120.5 − 126.66) × 2,200 = −13,552 for a short.
         const currentPrice = (): number => {
             const md = context.marketData;
             if (Array.isArray(md) && context.idx >= 0 && context.idx < md.length) {
-                return md[context.idx]?.close ?? NaN;
+                return brokerPrice(context, md[context.idx]?.close ?? NaN);
             }
             return NaN;
         };
@@ -65,25 +71,28 @@ export function opentrades(context: any) {
         const costBasis = (t: Trade): number =>
             Math.abs(t.size) * t.entry_price * pointValue + (t.commission ?? 0);
 
+        // Out of range: 0 for the numeric getters, na for prices, bar indexes and times (TradingView).
         result.profit = (i: any) => {
             const t = at(i);
-            if (!t) return NaN;
+            if (!t) return 0;
             const cp = currentPrice();
             if (!Number.isFinite(cp)) return NaN;
             const dir = Math.sign(t.size);
             const priceChange = dir === 1 ? cp - t.entry_price : t.entry_price - cp;
             return priceChange * Math.abs(t.size) * pointValue - (t.commission ?? 0) - hypotheticalExitComm(t, cp);
         };
+        // A negative basis (negative prices) is divided by too: TradingView, CL1! 1D, short 2 @ −34.99
+        // with 6 entry commission, profit 1,228 → 1,228 / −69,974 = −1.7549 %.
         result.profit_percent = (i: any) => {
             const t = at(i);
-            if (!t) return NaN;
+            if (!t) return 0;
             const p = result.profit(i);
             if (!Number.isFinite(p)) return NaN;
             const basis = costBasis(t);
-            return basis > 0 ? (100 * p) / basis : NaN;
+            return basis !== 0 ? (100 * p) / basis : NaN;
         };
-        result.size = (i: any) => at(i)?.size ?? NaN;
-        result.commission = (i: any) => at(i)?.commission ?? NaN;
+        result.size = (i: any) => at(i)?.size ?? 0;
+        result.commission = (i: any) => at(i)?.commission ?? 0;
         result.entry_price = (i: any) => at(i)?.entry_price ?? NaN;
         result.entry_bar_index = (i: any) => at(i)?.entry_bar_index ?? NaN;
         result.entry_id = (i: any) => at(i)?.entry_id ?? '';
@@ -104,27 +113,20 @@ export function opentrades(context: any) {
             return basis > 0 ? (100 * t.max_runup) / basis : 0;
         };
 
-        // capital_held: total capital tied up by all open trades, respecting
-        // margin%. Pine exposes this as a PROPERTY (not method).
-        //
-        // TV-observed semantic: returns `na` when no margin is configured
-        // (both margin_long and margin_short default to 100). In that case
-        // the broker isn't "holding" any capital aside from the position
-        // itself — there's no margin reserve to report. Only when margin is
-        // explicitly set do we sum notional × margin%.
+        // capital_held (a PROPERTY in Pine): the full notional of the open trades, Σ |size| × entry
+        // price × point value, whatever the margin percentage; 0 when flat. `na` without a margin
+        // model (margin 0, the v5 default). TradingView: 39,999.56 = 0.64828 × 61,701.06 at 20%
+        // margin, 61,701.06 for 1 contract at the v6 default of 100%.
         const s = context.strategy;
         const marginLong  = s?.config?.margin_long  ?? 100;
         const marginShort = s?.config?.margin_short ?? 100;
-        const marginConfigured = marginLong !== 100 || marginShort !== 100;
-        if (!s || s.opentrades.length === 0 || !marginConfigured) {
+        const dir = Math.sign(s?.position_size ?? 0);
+        const noMargin = !s || (dir > 0 ? !(marginLong > 0) : dir < 0 ? !(marginShort > 0) : !(marginLong > 0) && !(marginShort > 0));
+        if (noMargin) {
             result.capital_held = NaN;
         } else {
             let totalHeld = 0;
-            for (const t of s.opentrades) {
-                const notional = Math.abs(t.size) * t.entry_price;
-                const marginPct = t.size > 0 ? marginLong : marginShort;
-                totalHeld += notional * (marginPct / 100);
-            }
+            for (const t of list) totalHeld += Math.abs(t.size) * t.entry_price * pointValue;
             result.capital_held = totalHeld;
         }
 

@@ -167,7 +167,7 @@ plot(sum)
         const jsCode = result.toString();
 
         expect(jsCode).toContain('for (');
-        expect(jsCode).toContain('let i = 0;');
+        expect(jsCode).toContain('let i = 0, __for_up0 = i <= 10');
         expect(jsCode).toContain('i <= 10');
         expect(jsCode).toContain('i++');
     });
@@ -315,9 +315,22 @@ plot(tick_counter)
         const result = transpile(code);
         const jsCode = result.toString();
 
-        // varip uses initVar like var
+        // varip uses initVar like var, flagged so re-executions of a bar do not roll it back
         expect(jsCode).toContain('$.initVar(');
         expect(jsCode).toContain('$.var.glb1_tick_counter');
+        expect(jsCode).toMatch(/\$\.initVar\(\$\.var\.glb1_tick_counter, [^)]*, true\)/);
+    });
+
+    it('should not flag a plain var as varip', () => {
+        const jsCode = transpile(`
+//@version=6
+indicator("Var Test")
+var int n = 0
+n += 1
+plot(n)
+`).toString();
+        expect(jsCode).toMatch(/\$\.initVar\(\$\.var\.glb1_n, [^,)]*\)/);
+        expect(jsCode).not.toMatch(/\$\.initVar\([^)]*, true\)/);
     });
 
     it('should transpile reassignment operator :=', () => {

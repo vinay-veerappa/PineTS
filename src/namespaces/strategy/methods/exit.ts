@@ -4,7 +4,8 @@
 import { Order } from '../types';
 import { Series } from '../../../Series';
 import { parseArgsForPineParams, extractCallsiteId } from '../../utils';
-import { roundToMintick } from '../utils';
+import { roundToMintick, roundOrderLevel, parseDirection, placeOrder, floorQty, trailArmPrice } from '../utils';
+import { checkExitLegs, checkQtyPercent } from '../validation';
 
 /**
  * Pine signature (21 named args):
@@ -54,23 +55,11 @@ export function exit(context: any) {
             throw new Error('strategy.exit() called before strategy() declaration');
         }
 
-        // Extract the transpiler-injected callsite ID BEFORE parsing args
-        // (so parseArgsForPineParams doesn't see the sentinel). When the call
-        // comes from non-transpiled JS, the sentinel is absent — fall back
-        // to a per-bar synthetic counter so each "raw" call still gets a
-        // stable id within the bar (the cadence check below is fuzzier in
-        // that case but still works for the canonical patterns).
-        let callsiteId = extractCallsiteId(args);
-        if (callsiteId === undefined) {
-            const s = context.strategy;
-            if (s._exit_fallback_last_bar !== context.idx) {
-                s._exit_fallback_counter = 0;
-                s._exit_fallback_last_bar = context.idx;
-            }
-            callsiteId = `exit_raw_${s._exit_fallback_counter++}`;
-        }
+        // Drop the transpiler-injected callsite sentinel before parsing args.
+        extractCallsiteId(args);
 
         const parsed = parseArgsForPineParams<any>(args, EXIT_SIGNATURES, EXIT_ARGS_TYPES);
+        checkExitLegs(parsed);
 
         const extractValue = (val: any) => {
             if (val === undefined || val === null) return val;
@@ -89,32 +78,21 @@ export function exit(context: any) {
         // An na leg is absent: `limit = na` with `profit = ...` uses the profit leg.
         const isNaValue = (v: any) => (typeof v === 'number' && Number.isNaN(v)) || (typeof v === 'object' && v !== null && '__value' in v);
         const leg = (v: any) => (isNaValue(v) ? undefined : v);
-        const profit           = leg(extractValue(parsed.profit));
+        // Fractional tick counts (TradingView, mintick 0.01): `profit` / `loss` round to the next
+        // whole tick away from the entry (30000.4 and 30000.6 → 30001), `trail_offset` truncates
+        // (2000.4, 2000.5 and 2000.6 → 2000).
+        const wholeAway = (v: any) => (typeof v === 'number' ? Math.ceil(v - 1e-9) : v);
+        const wholeTrunc = (v: any) => (typeof v === 'number' ? Math.trunc(v + Math.sign(v) * 1e-9) : v);
+        const profit           = wholeAway(leg(extractValue(parsed.profit)));
         const limitRaw         = leg(extractValue(parsed.limit));
-        const loss             = leg(extractValue(parsed.loss));
+        const loss             = wholeAway(leg(extractValue(parsed.loss)));
         const stopRaw          = leg(extractValue(parsed.stop));
         const trailPriceRaw    = leg(extractValue(parsed.trail_price));
-        const trailPoints      = extractValue(parsed.trail_points);
-        const trailOffset      = extractValue(parsed.trail_offset);
+        const trailPoints      = leg(extractValue(parsed.trail_points));
+        const trailOffset      = wholeTrunc(leg(extractValue(parsed.trail_offset)));
 
-        // Snap limit/stop/trail_price to the mintick grid AWAY from the
-        // current bar's close (broker-emulator convention — see
-        // roundToMintick in utils.ts). Already-aligned inputs (e.g. an
-        // exact `position_avg_price + N`) round to themselves; arbitrary
-        // multiplications like `close * 0.95` get the same adverse
-        // rounding Pine applies at order placement.
-        const mintick = context.pine?.syminfo?.mintick ?? 0;
-        const currentClose = Series.from(context.data.close).get(0);
-        const limit       = limitRaw      !== undefined ? roundToMintick(limitRaw,      currentClose, mintick) : undefined;
-        const stop        = stopRaw       !== undefined ? roundToMintick(stopRaw,       currentClose, mintick) : undefined;
-        const trailPrice  = trailPriceRaw !== undefined ? roundToMintick(trailPriceRaw, currentClose, mintick) : undefined;
-
-        // Detect stale-attachment: when this exit is attached to a pending
-        // entry that REVERSES the current position, the user's absolute
-        // limit/stop values (computed from strategy.position_avg_price at
-        // call time) reflect the OUTGOING position's avg, not the incoming
-        // one. TV silently drops those legs; we mark the order here and
-        // processExitOrders skips the absolute legs when the flag is set.
+        // Whether this exit attaches to a pending entry that reverses the position (see the
+        // entry-bar exit path in processExitOrders).
         const fromEntryId = fromEntry ?? '';
         const pendingEntry = fromEntryId
             ? context.strategy.pending_orders.find(
@@ -124,29 +102,56 @@ export function exit(context: any) {
                   (o: Order) => o.category === 'entry' && o.status === 'pending',
               );
         const attachedAtReversal = !!pendingEntry?._isReversalEntry;
-        // Whether a trade this exit covers is already open. Its levels are then taken as given
-        // even when already breached (a sell stop above the market fills at the next open).
-        const coversOpenTrade = context.strategy.opentrades.some((t: any) => !fromEntryId || t.entry_id === fromEntryId);
 
-        // Cadence detection: persistent vs ephemeral capture.
-        // If the user called strategy.exit at THIS exact call site on the
-        // previous bar, the pattern is "every bar" (persistent — variable
-        // is in main scope, value always defined). If the prior bar had
-        // no call, the pattern is "sparse" (ephemeral — variable likely
-        // scoped to an if-block, NA on non-trigger bars in TV). Used
-        // below by processExitOrders to suppress the stale-reversal drop
-        // for persistent-pattern exits, matching TV's actual behavior of
-        // firing the captured value when the user keeps refreshing it.
-        const history = context.strategy._exit_call_history as Map<string, number>;
-        const lastBarForSite = history.get(callsiteId);
-        const isPersistent = lastBarForSite !== undefined && lastBarForSite === context.idx - 1;
-        history.set(callsiteId, context.idx);
+        // An exit for an entry id that is neither open nor pending when it is called places nothing
+        // (TradingView, BTCUSDT 1h / AAPL 1D: `strategy.exit("x", "D", ...)` called once just before
+        // `strategy.entry("D", ...)` never fires, 0 / 74).
+        if (fromEntryId && !pendingEntry && !(context.strategy.opentrades as any[]).some((t) => t.entry_id === fromEntryId)) return;
+        // `qty_percent` is only checked when `qty` does not override it
+        if (qty === undefined || qty === null || isNaValue(qty)) checkQtyPercent('strategy.exit', qtyPercent);
+
+        // Limit / stop levels go on the mintick grid by the exit's side, as entry levels do (TV, AAPL
+        // 1D: a short's stop at 53.4925 placed with the close at 53.5425 works at 53.50). Without a
+        // position or entry to tell the side, and for trail_price, they round away from the close
+        // (in a calc_on_order_fills execution, from the fill point).
+        const mintick = context.pine?.syminfo?.mintick ?? 0;
+        const currentClose = context._fillPointPrice ?? Series.from(context.data.close).get(0);
+        const openTrade = (context.strategy.opentrades as any[]).find((t) => !fromEntryId || t.entry_id === fromEntryId);
+        const positionDir = openTrade ? Math.sign(openTrade.size) : pendingEntry ? parseDirection(pendingEntry.direction) : 0;
+        const level = (raw: number | undefined, kind: 'limit' | 'stop') =>
+            raw === undefined ? undefined : positionDir ? roundOrderLevel(raw, -positionDir, kind, mintick) : roundToMintick(raw, currentClose, mintick);
+        const limit       = level(limitRaw, 'limit');
+        const stop        = level(stopRaw, 'stop');
+        const trailPrice  = trailPriceRaw !== undefined ? roundToMintick(trailPriceRaw, currentClose, mintick) : undefined;
+
+        // Pine semantic: calling strategy.exit with the same `id` REPLACES the
+        // prior pending exit order (allowing dynamic TP/SL adjustment each
+        // bar). Without this, stale exits accumulate across the strategy's
+        // lifetime — they survive past their originating trade, and when a
+        // later trade happens to satisfy the wrong-sided / stale-reversal
+        // checks geometrically, the old order fires at a phantom price.
+        // Same id + same from_entry scope is the replacement key.
+        const exitId = idValue ?? 'exit';
+        const list = context.strategy.pending_orders as Order[];
+        const replaced: Order[] = [];
+        for (let i = list.length - 1; i >= 0; i--) {
+            const o = list[i];
+            if (o.category === 'exit' && o.id === exitId && (o.from_entry ?? '') === fromEntryId && o.status === 'pending') {
+                replaced.push(o);
+                list.splice(i, 1);
+            }
+        }
+
+        // With every price leg na the call places no order, and a re-call cancels the
+        // pending exit it replaces (TradingView). It must not become a market close.
+        if ([profit, limit, loss, stop, trailPrice, trailPoints].every((v) => v === undefined)) return;
 
         const order: Order = {
-            id: idValue ?? 'exit',
+            id: exitId,
             direction: 0,           // resolved at trigger based on matching trades
-            qty: qty !== undefined ? Math.abs(Number(qty)) : 0,
-            qty_percent: qtyPercent,
+            // floored to the symbol's step; 0 is the whole position (TV, AAPL: qty = 0.5 exits all 4)
+            qty: qty !== undefined && qty !== null && !isNaValue(qty) ? floorQty(context, Math.abs(Number(qty))) : 0,
+            qty_percent: isNaValue(qtyPercent) ? undefined : qtyPercent,
             type: 'market',
             bar: context.idx,
             time: Series.from(context.data.openTime).get(0),
@@ -155,9 +160,13 @@ export function exit(context: any) {
             from_entry: fromEntryId,
             profit, loss, limit, stop,
             trail_price: trailPrice,
+            _trailPriceRaw: trailPriceRaw,
             trail_points: trailPoints,
             trail_offset: trailOffset,
             oca_name: extractValue(parsed.oca_name),
+            _priceLegsWin: context.pineVersion === 5,
+            // an exit's orders belong to its OCA group as strategy.oca.reduce members
+            oca_type: extractValue(parsed.oca_name) ? 'reduce' : undefined,
             comment: extractValue(parsed.comment),
             comment_profit: extractValue(parsed.comment_profit),
             comment_loss: extractValue(parsed.comment_loss),
@@ -167,47 +176,43 @@ export function exit(context: any) {
             alert_loss: extractValue(parsed.alert_loss),
             alert_trailing: extractValue(parsed.alert_trailing),
             disable_alert: extractValue(parsed.disable_alert),
-            trail_armed: false,
-            trail_peak: NaN,
             _attachedAtReversal: attachedAtReversal,
-            _coversOpenTrade: coversOpenTrade,
-            _isPersistent: isPersistent,
-            _callsiteId: callsiteId,
+            // Was a position open when this exit was placed? Such an order belongs to THAT position and dies with it
+            // (see processExitOrders); an exit placed while flat waits for its entry, as on TradingView.
+            _placedWithPosition: context.strategy.opentrades.length > 0,
+            _placedDir: Math.sign(context.strategy.position_size),
         };
 
-        // Pine semantic: calling strategy.exit with the same `id` REPLACES the
-        // prior pending exit order (allowing dynamic TP/SL adjustment each
-        // bar). Without this, stale exits accumulate across the strategy's
-        // lifetime — they survive past their originating trade, and when a
-        // later trade happens to satisfy the wrong-sided / stale-reversal
-        // checks geometrically, the old order fires at a phantom price.
-        // Same id + same from_entry scope is the replacement key.
-        //
-        // Trail state carry-over: `trail_armed` and `trail_peak` are NOT
-        // user-supplied parameters — they're engine-accumulated state that
-        // tracks the trail's progress across bars (running high for a long,
-        // running low for a short). When the user calls strategy.exit every
-        // bar (the canonical "persistent" pattern), naive replacement would
-        // reset these to false/NaN every bar, preventing the trail from ever
-        // accumulating beyond a single bar's range. TV's behavior is that
-        // the trail's state persists across re-calls — only the user-tunable
-        // parameters (trail_points, trail_offset, limit, stop, etc.) are
-        // refreshed. Mirror that by copying the trail state forward whenever
-        // the prior order had armed.
-        const exitId = order.id;
-        const list = context.strategy.pending_orders as Order[];
-        for (let i = list.length - 1; i >= 0; i--) {
-            const o = list[i];
-            if (o.category === 'exit' && o.id === exitId &&
-                (o.from_entry ?? '') === (order.from_entry ?? '') &&
-                o.status === 'pending') {
-                if (o.trail_armed) {
-                    order.trail_armed = true;
-                    order.trail_peak  = o.trail_peak;
-                }
-                list.splice(i, 1);
+        // Trail state carry-over: each trade's armed flag and running peak are
+        // engine-accumulated state, not user parameters. A re-call with the same
+        // activation (trail_price as passed, trail_points) keeps them, whatever else
+        // changes (offset, loss, ...). A re-call that moves the activation is a new
+        // trailing order that starts over (TV, BTCUSDT 1h: `trail_price = close`
+        // re-called every bar exits a long at the previous close minus the offset,
+        // 78,979.99, not at the previous high minus the offset, 79,020.61). The
+        // passed value is compared: its tick rounding follows the close.
+        const trails = replaced.find((o) => o._trailByTrade && o._trailPriceRaw === trailPriceRaw && o.trail_points === trailPoints);
+        if (trails) order._trailByTrade = { ...trails._trailByTrade };
+        // A trail whose activation level the close has already reached is active from that close,
+        // with the close as its peak (TV, ES: a short's trail activating at 2,013 placed on a 1,994.5
+        // close, offset 4, fills at 1,998.5 on the next bar).
+        if (order.trail_offset !== undefined && (trailPrice !== undefined || trailPoints !== undefined)) {
+            const close = context._fillPointPrice ?? Series.from(context.data.close).get(0);
+            for (const t of context.strategy.opentrades as any[]) {
+                if (fromEntryId && t.entry_id !== fromEntryId) continue;
+                if (order._trailByTrade?.[t.id]?.armed) continue;
+                const dir = Math.sign(t.size);
+                const arm = trailArmPrice(order, t._bracket_entry ?? t.entry_price, dir, mintick);
+                if (Number.isFinite(close) && dir * (close - arm) >= 0) (order._trailByTrade ??= {})[t.id] = { armed: true, peak: close };
             }
         }
-        list.push(order);
+        // Placement order decides which exit's quantity is reserved first (see exitCapacity); a
+        // re-call keeps the place of the exit it replaces.
+        const strat = context.strategy as any;
+        const seqs: Map<string, number> = (strat._exit_seqs ??= new Map());
+        const seqKey = `${exitId}\u0000${fromEntryId}`;
+        if (!seqs.has(seqKey)) seqs.set(seqKey, seqs.size + 1);
+        order._seq = seqs.get(seqKey);
+        placeOrder(context.strategy, order);
     };
 }

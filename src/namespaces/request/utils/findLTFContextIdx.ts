@@ -12,37 +12,16 @@ export function findLTFContextIdx(
     // Find the latest intrabar that is fully contained within the chart bar [myOpenTime, myCloseTime]
     for (let i = openTime.length - 1; i >= 0; i--) {
         if (closeTime[i] <= myCloseTime && openTime[i] >= myOpenTime) {
-            // Found the last intrabar for this chart bar
-
-            // Check if we're on an incomplete/current bar:
-            // If eDate is defined and the bar extends beyond it, this is the current bar being processed
-            const isCurrentBar = mainContextEDate && myCloseTime > mainContextEDate;
-
-            // For LTF with gaps=true and lookahead=true: ALWAYS return first intrabar (not just current bar)
-            if (gaps && lookahead) {
-                for (let j = 0; j < openTime.length; j++) {
-                    if (openTime[j] >= myOpenTime && openTime[j] < myCloseTime) {
-                        return j;
-                    }
-                    if (openTime[j] >= myCloseTime) {
-                        break;
-                    }
-                }
+            // Found the last intrabar for this chart bar.
+            // lookahead=true returns the FIRST intrabar of the chart bar, with or without gaps
+            // (TradingView, historical bars: 5m request on a 60m chart).
+            if (lookahead) {
+                let j = i;
+                while (j > 0 && openTime[j - 1] >= myOpenTime) j--;
+                return j;
             }
 
-            // For current bar with lookahead=true (and gaps=false): return the FIRST intrabar
-            if (isCurrentBar && lookahead && !gaps) {
-                for (let j = 0; j < openTime.length; j++) {
-                    if (openTime[j] >= myOpenTime && openTime[j] < myCloseTime) {
-                        return j;
-                    }
-                    if (openTime[j] >= myCloseTime) {
-                        break;
-                    }
-                }
-            }
-
-            // For historical bars OR lookahead=false: return the last intrabar
+            // lookahead=false: return the last intrabar
             return i;
         }
 

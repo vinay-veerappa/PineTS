@@ -2,8 +2,8 @@
 // Copyright (C) 2026 LuxAlgo
 
 /**
- * Price at which the current leveraged position would be force-liquidated.
- * Returns NaN when flat or when the relevant margin% is 100 (no leverage).
+ * Price at which the current position would be force-liquidated.
+ * Returns NaN when flat, without a margin model, and for a long at 100% margin.
  *
  * Official TV formula, documented at
  * https://www.tradingview.com/support/solutions/43000717375/ :
@@ -34,7 +34,13 @@ export function margin_liquidation_price(context: any) {
         const marginPct = direction === 1
             ? (s.config.margin_long  ?? 100)
             : (s.config.margin_short ?? 100);
-        if (marginPct >= 100) return NaN;  // No leverage → no liquidation.
+        // No margin model (margin 0, the v5 default): na. At exactly 100% a long has no liquidation
+        // price (the denominator is 0), while a short still has one: TradingView reports
+        // (equity / qty + entry) / 2 for 1 contract short at 62,867.99 with 101,166.93 realized
+        // equity → 82,017.46. Above 100% a long has one again: 131,526.56 =
+        // (10,000 / 0.07604 − 65,746.45) / 0.5 at margin_long = 150.
+        if (!(marginPct > 0)) return NaN;
+        if (direction === 1 && marginPct === 100) return NaN;
 
         const qty        = Math.abs(s.position_size);
         const pointValue = context.pine?.syminfo?.pointvalue ?? 1;
@@ -47,9 +53,11 @@ export function margin_liquidation_price(context: any) {
         // Per the TV docs, the raw value is rounded to the nearest mintick:
         // DOWN for longs (toward more negative, safer/farther from current),
         // UP for shorts (toward more positive, safer/farther from current).
+        // The epsilon keeps float noise on an exact tick (…31.0000000001) from moving it a tick.
         const mintick = context.pine?.syminfo?.mintick ?? 0.01;
+        const ticks = raw / mintick;
         return direction === 1
-            ? Math.floor(raw / mintick) * mintick
-            : Math.ceil(raw / mintick)  * mintick;
+            ? Math.floor(ticks + 1e-6) * mintick
+            : Math.ceil(ticks - 1e-6)  * mintick;
     };
 }

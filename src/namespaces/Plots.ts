@@ -1,12 +1,12 @@
 import type { BackgroundColorOptions, BarColorOptions, FillOptions, PlotArrowOptions, PlotBarOptions, PlotCandleOptions, PlotOptions, PlotCharOptions, PlotShapeOptions, HlineOptions } from '../types/PineTypes';
 import { Series } from '../Series';
-import { parseArgsForPineParams, extractCallsiteId } from './utils';
+import { parseArgsForPineParams, extractCallsiteId, isNamedArgsBag } from './utils';
 import { silentInSecondary } from './silentInSecondary';
 
 //prettier-ignore
 const PLOT_SIGNATURE = [
     'series', 'title', 'color', 'linewidth', 'style', 'trackprice', 'histbase', 'offset',
-    'join', 'editable', 'show_last', 'display', 'format', 'precision', 'force_overlay',
+    'join', 'editable', 'show_last', 'display', 'format', 'precision', 'force_overlay', 'linestyle',
 ];
 
 //prettier-ignore
@@ -64,12 +64,31 @@ const FILL_SIGNATURE = [
     'plot1', 'plot2', 'color', 'title', 'editable', 'show_last', 'fillgaps', 'display',
 ];
 
+// fill(hline1, hline2, ...) has no show_last
+//prettier-ignore
+const HLINE_FILL_SIGNATURE = [
+    'plot1', 'plot2', 'color', 'title', 'editable', 'fillgaps', 'display',
+];
+
+//prettier-ignore
+const GRADIENT_FILL_SIGNATURE = [
+    'plot1', 'plot2', 'top_value', 'bottom_value', 'top_color', 'bottom_color', 'title', 'display', 'fillgaps', 'editable',
+];
+
+//prettier-ignore
+const GRADIENT_FILL_ARGS_TYPES = {
+    plot1: 'object', plot2: 'object', top_value: 'number', bottom_value: 'number', top_color: 'color', bottom_color: 'color',
+    title: 'string', display: 'string', fillgaps: 'boolean', editable: 'boolean',
+};
+
+const GRADIENT_FILL_KEYS = ['top_value', 'bottom_value', 'top_color', 'bottom_color'];
+
 //prettier-ignore
 const PLOT_ARGS_TYPES = {
     series: 'series', title: 'string', color: 'color', linewidth: 'number',
     style: 'string', trackprice: 'boolean', histbase: 'number', offset: 'number',
-    join: 'bool', editable: 'boolean', show_last: 'number', display: 'string',
-    format: 'string', precision: 'number', force_overlay: 'boolean',
+    join: 'boolean', editable: 'boolean', show_last: 'number', display: 'string',
+    format: 'string', precision: 'number', force_overlay: 'boolean', linestyle: 'string',
 };
 
 //prettier-ignore
@@ -483,24 +502,30 @@ export class FillHelper {
 
         // Detect gradient fill: fill(plot1, plot2, top_value, bottom_value, top_color, bottom_color, ...)
         // vs simple fill:       fill(plot1, plot2, color, title, ...)
-        // Positional form: 3rd arg (index 2) is a number (top_value).
-        // Named form: transpiler may bundle named args into an object at index 2
-        // containing top_value, bottom_value, top_color, bottom_color.
-        const isGradientPositional = args.length >= 6 && typeof args[2] === 'number';
-        const namedArgs = !isGradientPositional && args.length >= 3 && args[2] !== null
-            && typeof args[2] === 'object' && 'top_value' in args[2] ? args[2] : null;
-        const isGradientFill = isGradientPositional || namedArgs !== null;
+        // Positional form: the 3rd and 4th args are numbers (top_value,
+        // bottom_value; a simple fill's 4th is its title). Any argument may
+        // instead come by name, in the trailing named-args object the
+        // transpiler emits (`…, title="Grad2")` → `…, {title: "Grad2"})`).
+        let named = args.length > 0 && isNamedArgsBag(args[args.length - 1]) ? args[args.length - 1] : null;
+        const positional = named ? args.length - 1 : args.length;
+        // The hline overload names its first two parameters hline1 / hline2.
+        if (named && ('hline1' in named || 'hline2' in named)) {
+            const { hline1, hline2, ...rest } = named;
+            named = { ...rest, ...(hline1 !== undefined && { plot1: hline1 }), ...(hline2 !== undefined && { plot2: hline2 }) };
+            args = [...args.slice(0, -1), named];
+        }
+        const isGradientFill =
+            (named !== null && GRADIENT_FILL_KEYS.some((k) => k in named)) ||
+            (positional >= 4 && typeof args[2] === 'number' && typeof args[3] === 'number');
 
         if (isGradientFill) {
-            const plot1 = args[0];
-            const plot2 = args[1];
-            const top_value = namedArgs ? Series.from(namedArgs.top_value).get(0) : args[2];
-            const bottom_value = namedArgs ? Series.from(namedArgs.bottom_value).get(0) : args[3];
-            const top_color = namedArgs ? Series.from(namedArgs.top_color).get(0) : args[4];
-            const bottom_color = namedArgs ? Series.from(namedArgs.bottom_color).get(0) : args[5];
-            const title = namedArgs
-                ? (namedArgs.title || undefined)
-                : (args.length > 6 && typeof args[6] === 'string' ? args[6] : undefined);
+            const _parsed = parseArgsForPineParams<any>(args, GRADIENT_FILL_SIGNATURE, GRADIENT_FILL_ARGS_TYPES);
+            const { plot1, plot2, editable, fillgaps, display } = _parsed;
+            const top_value = Series.from(_parsed.top_value).get(0);
+            const bottom_value = Series.from(_parsed.bottom_value).get(0);
+            const top_color = Series.from(_parsed.top_color).get(0);
+            const bottom_color = Series.from(_parsed.bottom_color).get(0);
+            const title = typeof _parsed.title === 'string' && _parsed.title ? _parsed.title : undefined;
 
             const p1Key = plot1?._plotKey || plot1?.title;
             const p2Key = plot2?._plotKey || plot2?.title;
@@ -519,6 +544,7 @@ export class FillHelper {
                     options: {
                         plot1: p1Key,
                         plot2: p2Key,
+                        editable, fillgaps, display,
                         style: 'fill',
                         gradient: true,
                     },
@@ -534,7 +560,9 @@ export class FillHelper {
                 options: { top_value, bottom_value, top_color, bottom_color },
             });
         } else {
-            const _parsed = parseArgsForPineParams<FillOptions>(args, FILL_SIGNATURE, FILL_ARGS_TYPES);
+            const first = Series.from(named && 'plot1' in named ? named.plot1 : args[0]).get(0);
+            const signature = first?.options?.style === 'hline' ? HLINE_FILL_SIGNATURE : FILL_SIGNATURE;
+            const _parsed = parseArgsForPineParams<FillOptions>(args, signature, FILL_ARGS_TYPES);
             const { plot1, plot2, color, title, editable, show_last, fillgaps, display } = _parsed;
 
             // For fill: prefer title, then callsite ID, then generic fallback

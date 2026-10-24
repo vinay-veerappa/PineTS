@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 LuxAlgo
 
+import { tradeCostBasis } from '../utils';
+
 /**
- * Average per-trade return (as a percent) across winning closed trades.
- * NaN when no winners yet. Matches Pine's strategy.avg_winning_trade_percent.
+ * Average return of the winning closed trades as a percent: the mean of their
+ * strategy.closedtrades.profit_percent. NaN when no winners yet.
  */
 export function avg_winning_trade_percent(context: any) {
     return () => {
         const s = context.strategy;
         if (!s || s.wintrades === 0) return NaN;
+        const pointValue = context.pine?.syminfo?.pointvalue ?? 1;
         let sum = 0;
         for (const t of s.closedtrades) {
             if ((t.profit ?? 0) > 0) {
-                const notional = Math.abs(t.size) * t.entry_price;
-                if (notional > 0) sum += (100 * (t.profit ?? 0)) / notional;
+                const basis = tradeCostBasis(t, pointValue);
+                if (basis !== 0) sum += (100 * (t.profit ?? 0)) / basis;
             }
         }
         return sum / s.wintrades;

@@ -14,13 +14,17 @@ function barState(context: any, key: string | undefined, init: () => any) {
     if (!key) return undefined;
     if (!context.taState) context.taState = {};
     let state = context.taState[key];
-    if (!state) state = context.taState[key] = { lastIdx: -1, shared: false, prev: init(), current: init() };
+    if (!state) state = context.taState[key] = { lastIdx: -1, shared: false, prev: init(), current: init(), tick: -1 };
+    const tick = context._execTick ?? 0;
     if (context.idx > state.lastIdx) {
         if (state.lastIdx >= 0) state.prev = { ...state.current };
         state.lastIdx = context.idx;
-    } else if (state.current.callIdx === context.idx) {
+    } else if (state.current.callIdx === context.idx && state.tick === tick) {
+        // A second call within one execution of the bar. (Another execution of the same bar, e.g.
+        // under calc_on_order_fills, recomputes from `prev`.)
         state.shared = true;
     }
+    state.tick = tick;
     return state.shared ? undefined : state;
 }
 
@@ -61,8 +65,12 @@ export function consecutiveMoves(context: any, key: string | undefined, series: 
  * non-na: TradingView's `ta.cross` / `ta.crossover` / `ta.crossunder` compare against that bar, so
  * an na on the previous bar does not hide a cross.
  *
- * With a key, calls on consecutive bars carry the last valid pair forward; a first call, a call after
- * skipped bars or a keyless call walks the series back instead.
+ * With a key, the previous pair is the one of this call's last evaluation, also when bars were
+ * skipped: a cross in the right operand of `and` / `or`, not evaluated on the bars the left one
+ * decides, compares against the values it last saw (TradingView, Pine v6 lazy evaluation: a long
+ * add `position_size > 0 and ta.crossover(close, ema)` fires on the first bar in position when
+ * close is above the ema it last saw below). Its first evaluation has no previous pair. Without a
+ * key (or with a key shared by several calls) the series is walked back instead.
  */
 export function crossPair(context: any, key: string | undefined, s1: any, s2: any): [number, number, number, number] {
     const a0 = s1.get(0);
@@ -71,9 +79,11 @@ export function crossPair(context: any, key: string | undefined, s1: any, s2: an
 
     let a1 = NaN;
     let b1 = NaN;
-    if (state && state.prev.callIdx === context.idx - 1) {
-        a1 = state.prev.a;
-        b1 = state.prev.b;
+    if (state) {
+        if (state.prev.callIdx >= 0) {
+            a1 = state.prev.a;
+            b1 = state.prev.b;
+        }
     } else {
         for (let k = 1; k <= context.idx; k++) {
             const a = s1.get(k);

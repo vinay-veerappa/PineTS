@@ -32,6 +32,7 @@ Every example below is exercised by a verification harness at `PineTS/.scratchpa
 - [Constants](#constants)
 - [Risk management](#risk-management)
 - [Conversion helpers](#conversion-helpers)
+- [Fills on the tick grid](#fills-on-the-tick-grid)
 - [Known divergences](#known-divergences)
 
 ---
@@ -628,6 +629,19 @@ await pine.run(($) => {
     const inSym  = strategy.convert_to_symbol(100);   // 100
     const qty    = strategy.default_entry_qty(50000); // (equity * 10%) / 50000
 });
+```
+
+---
+
+## Fills on the tick grid
+
+Split- and dividend-adjusted feeds (US equities) carry prices between ticks: AAPL's adjusted history has opens like `40.8125` while `syminfo.mintick` is `0.01`. TradingView's broker emulator trades such a bar at the nearest tick (`40.81`) — fills, order triggers, trailing-stop checks, margin checks and the close used for sizing — while the script keeps seeing the raw prices (`open` is still `40.8125`). PineTS does the same by default. Bars already on the grid (crypto, forex, futures, back-adjusted continuous futures) are unaffected.
+
+To have the broker use the raw feed prices instead:
+
+```javascript
+const pine = new PineTS(provider, 'AAPL', 'D');
+pine.setFillsOnTickGrid(false);
 ```
 
 ---

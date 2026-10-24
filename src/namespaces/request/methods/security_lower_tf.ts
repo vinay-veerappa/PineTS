@@ -4,9 +4,11 @@ import { PineTS } from '../../../PineTS.class';
 import { Series } from '../../../Series';
 import { formatTimeframe, parseTimeframe, timeframeSeconds } from '../../../timeframe';
 import { plainTickerId } from '../../../tickerModifier';
+import { runSecondary } from '../utils/runSecondary';
 import { PineArrayObject, PineArrayType } from '../../array/PineArrayObject';
 import { PineTypeObject } from '../../PineTypeObject';
 import { parseArgsForPineParams } from '../../utils';
+import { trackRequestContext, MAX_CALC_BARS } from '../../limits';
 
 // Pine signature (v5/v6):
 //   request.security_lower_tf(symbol, timeframe, expression, ignore_invalid_symbol, currency, ignore_invalid_timeframe, calc_bars_count)
@@ -222,7 +224,7 @@ async function buildFastBuiltinSecContext(
     // populated arrays — never call `run()`, so no transpile, no
     // iteration, no shifts, no helpers.
     const pineTS = new PineTS(context.source, _symbol, _timeframe, _calc_bars_count, effectiveSDate, secEDate);
-    pineTS.markAsSecondary();
+    pineTS.markAsSecondary(context);
     await pineTS.ready();
 
     // Use the openTime/closeTime arrays already prepared by the
@@ -305,7 +307,7 @@ export function security_lower_tf(context: any) {
         const _ignore_invalid_timeframe = resolveSlotValue(parsed.ignore_invalid_timeframe);
         const _calc_bars_count = (() => {
             const v = resolveSlotValue(parsed.calc_bars_count);
-            return typeof v === 'number' && v > 0 ? v : undefined;
+            return typeof v === 'number' && v > 0 ? Math.min(v, MAX_CALC_BARS) : undefined;
         })();
 
         // CRITICAL: Prevent infinite recursion in secondary contexts
@@ -363,6 +365,10 @@ export function security_lower_tf(context: any) {
         const builtinExpr = detectPureBuiltinExpression(originalSource, context);
 
         if (!context.cache[cacheKey]) {
+            // Count this new secondary context against the per-run request budget
+            // (fast or slow path, each is a provider fetch on the host's key) so an
+            // uncapped fan-out cannot drain the host operator's provider quota.
+            trackRequestContext(context, 'request.security_lower_tf');
             if (builtinExpr !== null) {
                 // ── Fast path ────────────────────────────────────────
                 const fastSecContext = await buildFastBuiltinSecContext(
@@ -398,30 +404,11 @@ export function security_lower_tf(context: any) {
                 const secEDate = lastBarCloseTime || context.eDate || Date.now();
 
                 const pineTS = new PineTS(context.source, _symbol, _timeframe, _calc_bars_count, adjustedSDate, secEDate);
-                pineTS.markAsSecondary();
+                pineTS.markAsSecondary(context);
 
-                // Truncated-slice slow path: when the transpiler emitted a
-                // slice for THIS call's expression name, the secondary
-                // runs the prefix-of-statements ending at the call —
-                // skipping all post-call work the slow path used to drag
-                // along. Falls back to running the FULL user script when
-                // no slice is available.
-                //
-                // For fn-nested calls (Phase 3), `request.param` runs
-                // inside a function scope and the codegen prefixes the
-                // param name with `$$.id + 'pN'` — so the runtime
-                // `_expression_name` is something like `<path>p3` whereas
-                // the slice map is keyed by the bare static `pN`. Extract
-                // the trailing `pN` for the lookup.
-                const exprNameStr = typeof _expression_name === 'string' ? _expression_name : '';
-                const sliceKey = exprNameStr.match(/p\d+$/)?.[0] ?? exprNameStr;
-                const slice = (context as any)._ltfTruncatedBodies?.[sliceKey];
-                let secContext: any;
-                if (slice) {
-                    secContext = await pineTS.runPretranspiled(slice);
-                } else {
-                    secContext = await pineTS.run(context.pineTSCode);
-                }
+                // The call site's truncated slice (the prefix of statements
+                // ending at the call), else the whole script — see runSecondary.
+                const secContext = await runSecondary(context, pineTS, _expression_name);
                 context.cache[cacheKey] = { pineTS, context: secContext, dataVersion: context.dataVersion };
             }
         }

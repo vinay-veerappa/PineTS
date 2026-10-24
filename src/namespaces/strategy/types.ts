@@ -57,6 +57,13 @@ export interface StrategyConfig {
 export interface Trade {
     id: string; // unique trade id (internal)
     _exits_filled?: Set<string>; // ids of strategy.exit orders that already closed part of this trade
+    // Excursion tracking on the bar path (see excOpen / excEndBar in utils.ts): per-unit best
+    // favourable / worst adverse move, path position observed up to, and where the trade opened.
+    _fav?: number;
+    _adv?: number;
+    _obsFrom?: number;
+    _openBar?: number;
+    _openAt?: number;
     _entry_qty?: number; // size when the trade opened (base of strategy.exit qty_percent)
     entry_id: string; // id passed to strategy.entry()
     entry_price: number;
@@ -82,6 +89,11 @@ export interface Trade {
      * before an older lot's (TV ledger convention).
      */
     _bracket_entry?: number;
+    /** Closed rows: the entry-leg part of `commission` (base of the `*_percent` getters). */
+    _entry_commission?: number;
+    // Set when a limit / stop entry filled this trade at a price level inside the bar (not at the
+    // open): exits on that bar only see the price path after the fill.
+    _intrabarEntry?: { bar: number; level: number; type: 'limit' | 'stop'; dir: number };
 }
 
 /**
@@ -134,43 +146,26 @@ export interface Order {
     alert_trailing?: string;
     disable_alert?: boolean;
     immediately?: boolean; // strategy.close/close_all: fill at current bar's close
-    // Internal: tracks the running peak used by trailing-stop logic.
-    // For a long: highest high seen since the trail armed; for a short: lowest low.
-    trail_peak?: number;
-    trail_armed?: boolean;
 
-    // Internal: set on `strategy.entry` orders that REVERSE the current
-    // position (opposite direction with existing size). Used by
-    // `strategy.exit` to detect when its absolute limit/stop values were
-    // computed from the OUTGOING position's avg (i.e. stale): the user
-    // typically writes `stop = strategy.position_avg_price + N` on the
-    // crossunder bar, but at that point position_avg_price still reflects
-    // the position being reversed away. TV silently ignores stale legs;
-    // PT drops them at trigger evaluation (see processExitOrders).
+    // Internal: set on `strategy.entry` orders that REVERSE the current position (opposite
+    // direction with existing size), and on `strategy.exit` orders attached to such an entry.
     _isReversalEntry?: boolean;
     _attachedAtReversal?: boolean;
-
-    // Internal: cadence-detection for strategy.exit. TV's broker
-    // emulator uses Pine's lazy series-eval semantic for exit
-    // parameters — the variable behind limit/stop is re-read each bar.
-    // For a variable scoped INSIDE an if-block (sparse pattern), that
-    // gives NA on non-trigger bars → TV doesn't fire stale captures.
-    // For a variable in MAIN scope (persistent pattern, called every
-    // bar), TV reads the captured value → fires stale captures.
-    //
-    // PT can't see the variable's scope from runtime, but the call
-    // CADENCE (how often the user calls strategy.exit per call site)
-    // correlates 1:1. Detected at queue time: if the user called this
-    // exit's callsite on the PRIOR bar, `_isPersistent = true`. Used
-    // by processExitOrders to suppress the stale-reversal drop on
-    // persistent-pattern exits.
-    _isPersistent?: boolean;
-    _callsiteId?: string;
-    // Internal: strategy.exit queued while a trade it covers was already open (its limit / stop
-    // levels are then never dropped as wrong-sided).
-    _coversOpenTrade?: boolean;
+    _placedWithPosition?: boolean;   // placed while a position was open: cancelled when that position goes flat
+    _seq?: number;                   // strategy.exit placement order (kept by re-calls)
+    _placed?: number;                // placement order of entries and exits (each call, see placeOrder)
+    _priceLegsWin?: boolean;         // strategy.exit in Pine v5: limit / stop / trail_price override the tick legs
+    _placedDir?: number;             // direction of the position open when the exit was placed
     // Internal: stop-limit entry whose stop has been reached; it now works as a limit order.
     _stopTriggered?: boolean;
+    // Internal: bar on which this entry waits for the exits reached before it on the bar's path.
+    _deferredPastExits?: number;
+    // Internal: strategy.exit trailing state of each trade it applies to, by trade id.
+    _trailByTrade?: Record<string, { armed: boolean; peak: number }>;
+    // Internal: strategy.exit trail_price as passed, before the tick rounding (which follows the close).
+    _trailPriceRaw?: number;
+    // Internal: the market order of a strategy.risk close-out (not checked against margin).
+    _risk?: boolean;
 
     // Internal: snapshot of open trade IDs at the moment strategy.close_all()
     // or strategy.close(id) was called. TV binds `close_all` / `close(id)` to
@@ -325,15 +320,5 @@ export interface StrategyState {
     // intraday rules — TODO: day rollover detection).
     risk_halted: boolean;
 
-    // Internal: per-callsite cadence tracking for strategy.exit. Keyed by the
-    // transpiler-injected __callsiteId; value is the last context.idx the user
-    // called strategy.exit at that site. Read at queue time to detect whether
-    // the prior bar also called this site (persistent pattern) or not (sparse
-    // / inside-if-block pattern). See Order._isPersistent.
-    _exit_call_history?: Map<string, number>;
-    // Fallback counter for non-transpiled callers (no __callsiteId injection)
-    // — paired with per-bar reset so each "first-of-bar" raw call gets a
-    // stable synthetic id like `exit_raw_N`.
-    _exit_fallback_counter?: number;
     _exit_fallback_last_bar?: number;
 }

@@ -4,6 +4,8 @@
 import { Order } from '../types';
 import { Series } from '../../../Series';
 import { parseArgsForPineParams } from '../../utils';
+import { argValue, isNaArg, floorQty } from '../utils';
+import { checkQtyPercent } from '../validation';
 
 /**
  * Close all trades opened by entries with the given id at market.
@@ -37,7 +39,14 @@ export function close(context: any) {
             throw new Error('strategy.close() called before strategy() declaration');
         }
         const parsed = parseArgsForPineParams<any>(args, CLOSE_SIGNATURES, CLOSE_ARGS_TYPES);
-        const targetId = parsed.id;
+        const targetId = argValue(parsed.id);
+        // A quantity given as na is absent: the close takes the whole position.
+        const qtyArg = argValue(parsed.qty);
+        const qtyPercentArg = argValue(parsed.qty_percent);
+        // A quantity is floored to the symbol's step; 0 closes everything (TV, AAPL long of 4:
+        // qty = 1.7 closes 1, qty = 0.4 closes 4).
+        const qty = isNaArg(qtyArg) || qtyArg === undefined || qtyArg === null ? undefined : floorQty(context, Math.abs(Number(qtyArg)));
+        const qtyPercent = isNaArg(qtyPercentArg) ? undefined : qtyPercentArg;
         if (targetId === undefined || targetId === null) return;
 
         // TV semantic: strategy.close(id) called with no open trades matching
@@ -48,6 +57,8 @@ export function close(context: any) {
         // by fill time the new entry has already filled.
         const hasMatching = context.strategy.opentrades.some((t: any) => t.entry_id === targetId);
         if (!hasMatching) return;
+        // `qty_percent` is only checked when `qty` does not override it
+        if (qty === undefined) checkQtyPercent('strategy.close', qtyPercent);
 
         // TV semantic: strategy.close() supersedes any pending conditional
         // strategy.exit() orders that target the same entry id. Without this
@@ -66,9 +77,12 @@ export function close(context: any) {
                 o.trail_price !== undefined ||
                 o.trail_points !== undefined);
 
+        // A partial close (qty / qty_percent) leaves them working: the rest of the trade keeps its
+        // exits (TV: a 50% target fills on the bar after strategy.close(qty_percent = 50) filled).
         const pending = context.strategy.pending_orders;
+        const partial = (qty !== undefined && Number(qty) > 0) || (qtyPercent !== undefined && Number(qtyPercent) > 0 && Number(qtyPercent) < 100);
         for (const o of pending) {
-            if (isConditionalExit(o) && (o.from_entry ?? '') === targetId && o.status === 'pending') {
+            if (!partial && isConditionalExit(o) && (o.from_entry ?? '') === targetId && o.status === 'pending') {
                 o.status = 'cancelled';
             }
         }
@@ -91,16 +105,16 @@ export function close(context: any) {
             status: 'pending',
             category: 'exit',
             from_entry: targetId,
-            qty_percent: parsed.qty_percent,
-            comment: parsed.comment,
-            alert_message: parsed.alert_message,
-            immediately: parsed.immediately === true,
-            disable_alert: parsed.disable_alert,
+            qty_percent: qtyPercent,
+            comment: argValue(parsed.comment),
+            alert_message: argValue(parsed.alert_message),
+            immediately: argValue(parsed.immediately) === true,
+            disable_alert: argValue(parsed.disable_alert),
             _intended_trade_ids: context.strategy.opentrades.filter((t: any) => t.entry_id === targetId).map((t: any) => t.id),
         };
         // Resolve qty: if a fixed qty was passed it locks in here; otherwise
         // the engine computes from the matching position at fill time.
-        if (parsed.qty !== undefined) order.qty = Math.abs(Number(parsed.qty));
+        if (qty !== undefined) order.qty = qty;
 
         context.strategy.pending_orders.push(order);
     };

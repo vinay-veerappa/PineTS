@@ -75,9 +75,9 @@ export function kc(context: any) {
         // We read from 'prev' state and write to 'current' state (tentative)
         const updateEma = (committedState: any, tentativeState: any, value: number, period: number) => {
             if (isNaN(value)) {
-                 // Propagate previous state
-                 Object.assign(tentativeState, committedState);
-                 return tentativeState.prevEma !== null ? tentativeState.prevEma : NaN;
+                // As ta.ema: na on the na bar, the state carried to the next one
+                Object.assign(tentativeState, committedState);
+                return NaN;
             }
 
             let initCount = committedState.initCount;

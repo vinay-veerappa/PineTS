@@ -35,8 +35,12 @@ import {
     SwitchExpression,
     SwitchCase,
     VariableDeclarationKind,
+    ImportDeclaration,
 } from './ast';
 import { NAMESPACE_COLLISION_NAMES } from '../settings';
+import { readImportStatement } from './imports';
+
+const TYPE_QUALIFIERS = ['const', 'simple', 'series'];
 
 export class Parser {
     private tokens: Token[];
@@ -65,6 +69,8 @@ export class Parser {
     private functionParamNames: Map<string, string[] | null> = new Map();
     // Opening `[` of each tuple literal, for errors reported at the literal.
     private tupleLiteralStart: WeakMap<object, Token> = new WeakMap();
+    // Numbers each range loop's direction variable.
+    private forLoopCount = 0;
     constructor(tokens: Token[]) {
         this.tokens = tokens;
         this.pos = 0;
@@ -346,13 +352,49 @@ export class Parser {
 
             if (this.match(TokenType.EOF)) break;
 
-            const stmt = this.parseStatement();
+            const stmt = this.parseTopLevelStatement();
             if (stmt) body.push(stmt);
 
             this.skipNewlines();
         }
 
         return new Program(body);
+    }
+
+    // `import` and `export` only exist in the global scope. Used as names
+    // (`import = 1`, `export(x) => x`) they fall through to parseStatement's
+    // reserved-name error.
+    private parseTopLevelStatement() {
+        if (this.isImportStatement()) {
+            const line = this.peek().line;
+            const { spec, next } = readImportStatement(this.tokens, this.pos);
+            this.pos = next;
+            const node: any = new ImportDeclaration(spec.path, spec.user, spec.name, spec.version, spec.alias);
+            node._line = line;
+            return node;
+        }
+        if (this.isExportStatement()) {
+            const exportToken = this.advance();
+            const stmt = this.parseStatement(false);
+            if (stmt?.type !== 'FunctionDeclaration' && stmt?.type !== 'TypeDefinition' && !stmt?._enum) {
+                throw new Error(`Only functions, methods, types and enums can be exported at ${this.startOf(exportToken)}`);
+            }
+            stmt.exported = true;
+            return stmt;
+        }
+        return this.parseStatement();
+    }
+
+    // `import user/...`: the path starts with a word (or a digit-led user name).
+    private isImportStatement(): boolean {
+        const next = this.peek(1).type;
+        return this.match(TokenType.KEYWORD, 'import') && (next === TokenType.IDENTIFIER || next === TokenType.NUMBER);
+    }
+
+    // `export f(...)`, `export float f(...)`, `export type / method / enum ...`
+    private isExportStatement(): boolean {
+        const next = this.peek(1).type;
+        return this.match(TokenType.KEYWORD, 'export') && (next === TokenType.IDENTIFIER || next === TokenType.KEYWORD);
     }
 
     // Pine keeps functions and variables in separate namespaces, so a variable may
@@ -366,13 +408,14 @@ export class Parser {
             if (t.type === TokenType.INDENT) depth++;
             else if (t.type === TokenType.DEDENT) depth--;
             const atLineStart = i === 0 || this.tokens[i - 1].type === TokenType.NEWLINE || this.tokens[i - 1].type === TokenType.DEDENT;
+            const prev = this.tokens[i - 1];
+            const afterExport = prev?.type === TokenType.KEYWORD && prev.value === 'export';
             if (depth === 0 && t.type === TokenType.KEYWORD && t.value === 'type' && i + 1 < this.tokens.length) {
-                const prev = this.tokens[i - 1];
-                if (atLineStart || (prev?.type === TokenType.KEYWORD && prev.value === 'export')) {
+                if (atLineStart || afterExport) {
                     this.typeNames.add(this.tokens[i + 1].value);
                 }
             }
-            if (depth !== 0 || !atLineStart || t.type !== TokenType.IDENTIFIER) continue;
+            if (depth !== 0 || !(atLineStart || afterExport) || t.type !== TokenType.IDENTIFIER) continue;
             this.pos = i;
             if (!this.isFunctionDeclaration()) continue;
             const hasReturnType = this.peek(1).type !== TokenType.LPAREN;
@@ -502,6 +545,10 @@ export class Parser {
         // While loop
         else if (this.match(TokenType.KEYWORD, 'while')) {
             stmt = this.parseWhileStatement();
+        }
+        else if (this.isImportStatement() || this.isExportStatement()) {
+            const token = this.peek();
+            throw new Error(`"${token.value}" is only allowed in the global scope at ${this.startOf(token)}`);
         }
         // Break/continue statements
         else if (this.match(TokenType.KEYWORD, 'break') || this.match(TokenType.KEYWORD, 'continue')) {
@@ -721,10 +768,9 @@ export class Parser {
             new Property(new Identifier(m.name), new Literal(m.title !== null ? m.title : m.name)),
         );
         const objExpr = new ObjectExpression(props);
-        return new VariableDeclaration(
-            [new VariableDeclarator(new Identifier(name), objExpr)],
-            VariableDeclarationKind.CONST
-        );
+        const decl: any = new VariableDeclaration([new VariableDeclarator(new Identifier(name), objExpr)], VariableDeclarationKind.CONST);
+        decl._enum = true;
+        return decl;
     }
 
     parseTypeDefinition() {
@@ -751,6 +797,16 @@ export class Parser {
             if (this.match(TokenType.KEYWORD, 'varip')) {
                 this.advance();
             }
+            // `name = value` without a type annotation: TradingView infers the field type from the default.
+            if (this.isNameSlot(this.peek()) && this.peek(1).type === TokenType.OPERATOR && this.peek(1).value === '=') {
+                const fieldName = this.expectName().value;
+                this.advance();
+                this.skipNewlines();
+                const defaultValue = this.parseExpression();
+                fields.push({ type: this.inferFieldType(defaultValue), name: fieldName, defaultValue });
+                this.skipNewlines();
+                continue;
+            }
             const fieldType = this.parseTypeExpression(); // Now handles generics
             // Field names may be contextual keywords (`int type = 0`) — the lexer
             // already delivers them as identifiers here; reserved words are rejected.
@@ -774,6 +830,18 @@ export class Parser {
         return new TypeDefinition(name, fields);
     }
 
+    /** Type of an untyped UDT field, from its default value. */
+    inferFieldType(expr: any): string {
+        if (expr?.type === 'UnaryExpression' && (expr.operator === '-' || expr.operator === '+')) return this.inferFieldType(expr.argument);
+        if (expr?.type === 'Literal') {
+            if (typeof expr.value === 'boolean') return 'bool';
+            if (typeof expr.value === 'string') return 'string';
+            if (typeof expr.value === 'number') return typeof expr.raw === 'string' && /^\d+$/.test(expr.raw) ? 'int' : 'float';
+        }
+        if (expr?.type === 'MemberExpression' && expr.object?.type === 'Identifier' && expr.object.name === 'color') return 'color';
+        return 'float';
+    }
+
     // Parse var/varip declaration
     parseVarDeclaration() {
         const keyword = this.advance();
@@ -785,7 +853,7 @@ export class Parser {
         // `var const int x = 1` — a type qualifier may sit between the keyword and the type.
         if (
             this.peek().type === TokenType.IDENTIFIER &&
-            ['const', 'simple', 'series'].includes(this.peek().value) &&
+            TYPE_QUALIFIERS.includes(this.peek().value) &&
             this.peek(1).type === TokenType.IDENTIFIER
         ) {
             this.advance();
@@ -913,6 +981,10 @@ export class Parser {
 
         // First token must be IDENTIFIER (already checked by caller)
         if (this.peek(offset).type !== TokenType.IDENTIFIER) return false;
+        // A qualifier may precede any type form: const array<bool> x =
+        if (TYPE_QUALIFIERS.includes(this.peek(offset).value) && this.peek(offset + 1).type === TokenType.IDENTIFIER) {
+            offset++;
+        }
         offset++;
 
         // Skip dotted type name: chart.point, line.style, etc.
@@ -960,6 +1032,10 @@ export class Parser {
     // Parse typed variable declaration (int x = ... or series float x = ...)
     // Also handles: type[] name = ..., type<generic> name = ..., ns.type[] name = ...
     parseTypedVarDeclaration() {
+        let qualifier = '';
+        if (TYPE_QUALIFIERS.includes(this.peek().value) && this.peek(1).type === TokenType.IDENTIFIER) {
+            qualifier = this.advance().value + ' ';
+        }
         let varType = this.advance().value;
 
         // Handle dotted type names: chart.point, line.style, etc.
@@ -1008,6 +1084,7 @@ export class Parser {
                 varType += ' ' + this.advance().value;
             }
         }
+        varType = qualifier + varType;
 
         const name = this.variableName(this.expectName().value);
 
@@ -1320,40 +1397,50 @@ export class Parser {
      * the final iteration. Handles if/else chains by adding a return to each branch.
      */
     private _addImplicitReturn(statements: any[]): void {
-        const last = statements[statements.length - 1];
-        if (last.type === 'ForStatement' || last.type === 'WhileStatement') {
-            this._addImplicitReturnToLoop(statements);
-        } else {
-            this._emitLastValue(statements, (value) => new ReturnStatement(value));
-        }
+        this._emitLastValue(statements, (value) => new ReturnStatement(value));
     }
 
     /**
      * Give a trailing loop a value: Pine yields whatever the loop body's last statement
      * produced on its final iteration, or na when the body never ran (or the final
-     * iteration skipped it). Captures that into a temp reset at the top of each iteration.
+     * iteration skipped it). Captures that into a temp reset at the top of each iteration
+     * and returns the temp's name, or null when the loop body has no value.
      */
-    private _addImplicitReturnToLoop(statements: any[]): void {
+    private _captureLoopValue(statements: any[]): string | null {
         const loop = statements[statements.length - 1];
-        if (loop.body?.type !== 'BlockStatement' || loop.body.body.length === 0) return;
+        if (loop.body?.type !== 'BlockStatement' || loop.body.body.length === 0) return null;
 
         const tmp = `__loopValue_${this.loopValueCounter++}`;
         const na = () => new Identifier('na');
         const assignTmp = (value: any) => new ExpressionStatement(new AssignmentExpression('=', new Identifier(tmp), value));
 
-        if (!this._emitLastValue(loop.body.body, assignTmp)) return;
+        if (!this._emitLastValue(loop.body.body, assignTmp)) return null;
         loop.body.body.unshift(assignTmp(na()));
         statements.splice(statements.length - 1, 0, new VariableDeclaration([new VariableDeclarator(new Identifier(tmp), na())], VariableDeclarationKind.LET));
-        statements.push(new ReturnStatement(new Identifier(tmp)));
+        return tmp;
+    }
+
+    /** A block used as a value (switch arm, if-expression branch) that ends in a loop takes the loop's value. */
+    private _valueOfTrailingLoop(statements: any[]): void {
+        const last = statements[statements.length - 1];
+        if (last?.type === 'ForStatement' || last?.type === 'WhileStatement') {
+            this._emitLastValue(statements, (value) => new ExpressionStatement(value));
+        }
     }
 
     /**
      * Rewrite the last statement of `statements` so its value flows into `emit`
-     * (a `return`, or an assignment to a temp). Recurses into if/else branches.
-     * Returns false when the last statement has no usable value (`break`, a loop, …).
+     * (a `return`, or an assignment to a temp). Recurses into if/else branches and
+     * trailing loops. Returns false when the last statement has no usable value (`break`, …).
      */
     private _emitLastValue(statements: any[], emit: (value: any) => any): boolean {
         const last = statements[statements.length - 1];
+        if (last.type === 'ForStatement' || last.type === 'WhileStatement') {
+            const tmp = this._captureLoopValue(statements);
+            if (!tmp) return false;
+            statements.push(emit(new Identifier(tmp)));
+            return true;
+        }
         if (last.type === 'ExpressionStatement') {
             const expr = last.expression;
             if (expr?.type === 'Identifier' && (expr.name === 'break' || expr.name === 'continue')) return false;
@@ -1629,11 +1716,16 @@ export class Parser {
 
             // Build for loop with runtime direction detection.
             // Pine Script: `for i = start to end [by step]`
-            // Direction is determined at runtime (start <= end → increment, else decrement).
-            // Generated: for (let i = start; start <= end ? i <= end : i >= end; start <= end ? i++ : i--)
-            const init = new VariableDeclaration([new VariableDeclarator(loopVar, start)], VariableDeclarationKind.LET);
-
-            const directionCheck = new BinaryExpression('<=', start, end);
+            // Direction is fixed when the loop starts (start <= end → increment, else
+            // decrement); `end` is re-read each iteration. Re-reading `start` for the
+            // direction would flip `for i = array.size(a) - 1 to 0` once the body
+            // removes an element.
+            // Generated: for (let i = start, up = i <= end; up ? i <= end : i >= end; up ? i++ : i--)
+            const directionCheck = new Identifier(`__for_up${this.forLoopCount++}`);
+            const init = new VariableDeclaration(
+                [new VariableDeclarator(loopVar, start), new VariableDeclarator(directionCheck, new BinaryExpression('<=', loopVar, end))],
+                VariableDeclarationKind.LET
+            );
             const test = new ConditionalExpression(
                 directionCheck,
                 new BinaryExpression('<=', loopVar, end),
@@ -2249,6 +2341,7 @@ export class Parser {
             if (stmt) consequentStmts.push(stmt);
         }
         this.advance(); // DEDENT
+        this._valueOfTrailingLoop(consequentStmts);
 
         let alternateStmts = [];
         if (this.match(TokenType.KEYWORD, 'else')) {
@@ -2281,6 +2374,7 @@ export class Parser {
                     if (stmt) alternateStmts.push(stmt);
                 }
                 this.advance(); // DEDENT
+                this._valueOfTrailingLoop(alternateStmts);
             }
         }
 
@@ -2361,6 +2455,7 @@ export class Parser {
                 const stmt = this.parseStatement();
                 if (stmt) consequentStmts.push(stmt);
             }
+            this._valueOfTrailingLoop(consequentStmts);
 
             // Extract the value expression from statements (for backwards compatibility)
             const consequent = this.getBlockValue(consequentStmts);

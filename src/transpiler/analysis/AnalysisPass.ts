@@ -316,6 +316,32 @@ export function preProcessUdtRegistry(ast: any, scopeManager: ScopeManager): voi
         },
     });
 
+    // Pass 2c: flag `varip` declarations. Codegen emits `"__pineVarip:<name>"`
+    // right before the `var` declaration it belongs to.
+    const flagVaripDeclarations = (body: any[]) => {
+        for (let i = 0; i < body.length - 1; i++) {
+            const expr = body[i]?.type === 'ExpressionStatement' ? body[i].expression : null;
+            if (expr?.type !== 'Literal' || typeof expr.value !== 'string' || !expr.value.startsWith('__pineVarip:')) continue;
+            const name = expr.value.slice('__pineVarip:'.length);
+            const next = body[i + 1];
+            if (next?.type !== 'VariableDeclaration' || next.kind !== 'var') continue;
+            for (const d of next.declarations) {
+                if (d.id?.type === 'Identifier' && d.id.name === name) d._varip = true;
+            }
+        }
+    };
+    walk.simple(ast, {
+        Program(node: any) {
+            flagVaripDeclarations(node.body);
+        },
+        BlockStatement(node: any) {
+            flagVaripDeclarations(node.body);
+        },
+        SwitchCase(node: any) {
+            flagVaripDeclarations(node.consequent);
+        },
+    });
+
     // Pass 3: collect UDT-typed function parameters from the
     // `funcName.__pineParamTypes__ = {paramName: 'TypeName', ...}` markers
     // emitted by pine2js codegen. Only types that are themselves in the UDT

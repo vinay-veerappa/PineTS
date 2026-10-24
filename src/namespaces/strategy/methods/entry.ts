@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 LuxAlgo
 
-import { calculateOrderQty, parseDirection, wouldExceedPyramiding, roundToMintick, sizingPrice } from '../utils';
+import { calculateOrderQty, parseDirection, wouldExceedPyramiding, roundOrderLevel, sizingPrice, isMarketCloseOrder, partialCloseQty, brokerPrice, placeOrder } from '../utils';
 import { Order } from '../types';
 import { Series } from '../../../Series';
 import { parseArgsForPineParams } from '../../utils';
+import { checkOrderQty, checkPendingDirection } from '../validation';
 
 /**
  * Pine signature:
@@ -65,6 +66,8 @@ export function entry(context: any) {
 
         const dir = parseDirection(directionVal);
         const strategy = context.strategy;
+        checkOrderQty('strategy.entry', qtyValue);
+        checkPendingDirection('strategy.entry', strategy, idValue, dir);
 
         // Project the position forward over MARKET entry orders already queued
         // on THIS bar: they fill (in queue order) before this one, so the
@@ -77,10 +80,27 @@ export function entry(context: any) {
         // entry reverses and the rest are plain pyramiding adds). The net
         // position change per queued order is `direction × qty`, which is exact
         // even for a reversal order since its qty already bakes in the close-qty.
+        // strategy.close / close_all market orders queued before this entry fill ahead of it
+        // too, so a close followed by an opposite entry opens just the entry's own qty, and a
+        // partial close leaves only the rest to reverse (TV, #316).
         let currentSize = strategy.position_size;
         for (const o of strategy.pending_orders) {
-            if (o.bar === context.idx && o.category === 'entry' && o.type === 'market') {
+            if (o.bar !== context.idx || o.status !== 'pending') continue;
+            // strategy.entry and strategy.order market orders (TV: an entry queued after a pending
+            // strategy.order in the other direction is sized to reverse it too)
+            if ((o.category === 'entry' || o.category === undefined) && o.type === 'market') {
                 currentSize += parseDirection(o.direction) * o.qty;
+            } else if (isMarketCloseOrder(o) && currentSize !== 0) {
+                let trades = strategy.opentrades.filter((t: any) => !o.from_entry || t.entry_id === o.from_entry);
+                if (o._intended_trade_ids) {
+                    const snapshot = new Set(o._intended_trade_ids);
+                    trades = trades.filter((t: any) => snapshot.has(t.id));
+                }
+                const tradesQty = trades.reduce((sum: number, t: any) => sum + Math.abs(t.size), 0);
+                let closeQty = tradesQty;
+                if (o.qty && o.qty > 0) closeQty = Math.min(o.qty, tradesQty);
+                else if (o.qty_percent && o.qty_percent > 0) closeQty = partialCloseQty(context, tradesQty, o.qty_percent);
+                currentSize -= Math.sign(currentSize) * Math.min(closeQty, Math.abs(currentSize));
             }
         }
 
@@ -95,7 +115,7 @@ export function entry(context: any) {
         // current position), Pine ADDS the absolute current position to the
         // requested qty so that one market order both flattens the prior
         // position AND opens the new direction with the requested size.
-        const currentPrice = Series.from(context.data.close).get(0);
+        const currentPrice = brokerPrice(context, Series.from(context.data.close).get(0));
 
         // Determine order type from limit/stop presence
         let orderType: 'market' | 'limit' | 'stop' | 'stop-limit' = 'market';
@@ -107,14 +127,12 @@ export function entry(context: any) {
             orderType = 'stop';
         }
 
-        // Snap limit/stop to the mintick grid AWAY from current price (the
-        // broker-emulator convention — see roundToMintick). For market
-        // orders this is a no-op.
+        // Limit / stop levels go on the mintick grid by the order's side (see roundOrderLevel).
         const mintick = context.pine?.syminfo?.mintick ?? 0;
-        const limitValueRounded = limitValue !== undefined ? roundToMintick(limitValue, currentPrice, mintick) : undefined;
-        const stopValueRounded  = stopValue  !== undefined ? roundToMintick(stopValue,  currentPrice, mintick) : undefined;
+        const limitValueRounded = limitValue !== undefined ? roundOrderLevel(limitValue, dir, 'limit', mintick) : undefined;
+        const stopValueRounded  = stopValue  !== undefined ? roundOrderLevel(stopValue,  dir, 'stop',  mintick) : undefined;
 
-        const baseQty = calculateOrderQty(context, qtyValue, dir, sizingPrice(stopValueRounded, limitValueRounded, currentPrice));
+        const baseQty = calculateOrderQty(context, qtyValue, dir, sizingPrice(stopValueRounded, limitValueRounded, currentPrice, dir), limitValueRounded === undefined);
 
         const isReversal = currentSize !== 0 && Math.sign(currentSize) !== dir;
         // An order smaller than the symbol's minimum quantity is rejected.
@@ -145,13 +163,16 @@ export function entry(context: any) {
             // overshoot as two separate lots (xlsx 2021-10-02: 5 +
             // 0.263108 longs at the same fill).
             _base_qty: baseQty,
+            // Reverses a position that only the market entries queued before it on this bar open.
+            _reversesPending: isReversal && Math.sign(strategy.position_size) !== Math.sign(currentSize),
         } as any;
 
-        // An entry with the id of an entry order still pending from an earlier bar modifies that
-        // order: a limit entry re-placed every day replaces yesterday's instead of piling up.
+        // An entry with the id of an unfilled strategy.entry / strategy.order modifies that order, also
+        // on the bar it was placed (TV: entry("M") then entry("M", qty = 2) on one bar is one trade of 2;
+        // a limit entry moved away on the same bar never fills at the first level).
         strategy.pending_orders = strategy.pending_orders.filter(
-            (o: Order) => !(o.category === 'entry' && o.id === idValue && o.status === 'pending' && o.bar < context.idx),
+            (o: Order) => !((o.category === 'entry' || o.category === undefined) && o.id === idValue && o.status === 'pending'),
         );
-        strategy.pending_orders.push(orderObj);
+        placeOrder(strategy, orderObj);
     };
 }

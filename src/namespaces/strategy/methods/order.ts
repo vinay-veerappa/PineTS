@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 LuxAlgo
 
-import { calculateOrderQty, parseDirection, sizingPrice } from '../utils';
+import { calculateOrderQty, parseDirection, sizingPrice, roundOrderLevel, brokerPrice, placeOrder } from '../utils';
 import { Order } from '../types';
 import { Series } from '../../../Series';
 import { parseArgsForPineParams } from '../../utils';
+import { checkOrderQty, checkPendingDirection } from '../validation';
 
 /**
  * Pine signature for strategy.order():
  *   strategy.order(id, direction, qty, limit, stop, oca_name, oca_type,
- *                  comment, alert_message, disable_alert) → void
+ *                  comment, alert_message, disable_alert) â†’ void
  *
  * The transpiler emits Pine's named-arg form as a trailing options object,
  * e.g. `strategy.order("buy", strategy.long, qty=1)` becomes
@@ -72,22 +73,29 @@ export function order(context: any) {
         const idValue       = extractValue(parsed.id);
         const directionVal  = extractValue(parsed.direction);
         const qtyValue      = priceLeg(extractValue(parsed.qty));
-        const limitValue    = priceLeg(extractValue(parsed.limit));
-        const stopValue     = priceLeg(extractValue(parsed.stop));
+        let limitValue      = priceLeg(extractValue(parsed.limit));
+        let stopValue       = priceLeg(extractValue(parsed.stop));
         const ocaName       = extractValue(parsed.oca_name);
         const ocaType       = extractValue(parsed.oca_type);
         const commentValue  = extractValue(parsed.comment);
 
         // Parse direction to numeric (+1 long, -1 short)
         const dir = parseDirection(directionVal);
+        checkOrderQty('strategy.order', qtyValue);
+        checkPendingDirection('strategy.order', context.strategy, idValue, dir);
 
         // Reference price for qty conversion (cash / percent_of_equity sizing).
         // The order itself fills at the NEXT bar's open, but qty is locked in
         // at the call site using the current close (the stop price of a stop or
-        // stop-limit order, the limit price of a limit order) — matching
+        // stop-limit order, the limit price of a limit order) â€” matching
         // TradingView's backtest accounting.
-        const currentPrice = Series.from(context.data.close).get(0);
-        const calculatedQty = calculateOrderQty(context, qtyValue, dir, sizingPrice(stopValue, limitValue, currentPrice));
+        const currentPrice = brokerPrice(context, Series.from(context.data.close).get(0));
+        // Limit / stop levels go on the mintick grid by the order's side, as for strategy.entry
+        // (TV: a buy limit at position_avg_price * 0.999 = 63,914.94108 works at 63,914.94).
+        const mintick = context.pine?.syminfo?.mintick ?? 0;
+        if (limitValue !== undefined) limitValue = roundOrderLevel(limitValue, dir, 'limit', mintick);
+        if (stopValue !== undefined) stopValue = roundOrderLevel(stopValue, dir, 'stop', mintick);
+        const calculatedQty = calculateOrderQty(context, qtyValue, dir, sizingPrice(stopValue, limitValue, currentPrice, dir), limitValue === undefined);
         // An order smaller than the symbol's minimum quantity is rejected.
         if (calculatedQty <= 0) return undefined;
 
@@ -118,7 +126,13 @@ export function order(context: any) {
             comment: commentValue,
         };
 
-        context.strategy.pending_orders.push(orderObj);
+        // An order with the id of an unfilled strategy.order / strategy.entry modifies it instead of
+        // adding another, also on the bar it was placed (TV: order("O", qty = 1) then order("O", qty = 2)
+        // is one trade of 2; a limit order re-placed every bar fills once).
+        context.strategy.pending_orders = context.strategy.pending_orders.filter(
+            (o: Order) => !((o.category === undefined || o.category === 'entry') && o.id === idValue && o.status === 'pending'),
+        );
+        placeOrder(context.strategy, orderObj);
 
         return orderObj;
     };

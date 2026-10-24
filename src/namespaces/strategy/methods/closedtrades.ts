@@ -2,6 +2,14 @@
 // Copyright (C) 2026 LuxAlgo
 
 import { Trade } from '../types';
+import { tradeCostBasis } from '../utils';
+
+/**
+ * TradingView keeps only the last 9,000 closed trades listed: `first_index` = closedtrades − 9,000
+ * (BINANCE:BTCUSDT 1h, 19,990 closed trades → 10,990), and a trade below it reads as out of range.
+ * The counts and the aggregates still cover every trade.
+ */
+const LISTED_CLOSED_TRADES = 9000;
 
 /**
  * Pine's `strategy.closedtrades` serves a dual role:
@@ -24,41 +32,43 @@ export function closedtrades(context: any) {
         // method calls must reflect the state at the bar where it was
         // produced, NOT the live (final-bar) state — otherwise every
         // historical plot point collapses to the final-bar count.
-        const live: Trade[] = context.strategy?.closedtrades ?? [];
-        const list: Trade[] = live.slice();
-        const at = (i: any): Trade | undefined => list[Number(i)];
+        // The list is append-only (a streaming rollback only truncates it),
+        // so its length at call time is the snapshot.
+        const list: Trade[] = context.strategy?.closedtrades ?? [];
+        const count = list.length;
+        const firstIndex = Math.max(0, count - LISTED_CLOSED_TRADES);
+        // `na` reads trade 0, as on TradingView.
+        const at = (i: any): Trade | undefined => {
+            let n = Number(i);
+            if (Number.isNaN(n)) n = 0;
+            return n >= firstIndex && n < count ? list[n] : undefined;
+        };
 
         const result: any = {
             // Scalar for consumers that store or plot the value (Series.from, $.param).
-            __value: list.length,
-            valueOf() { return list.length; },
-            toString() { return String(list.length); },
-            [Symbol.toPrimitive]() { return list.length; },
+            __value: count,
+            valueOf() { return count; },
+            toString() { return String(count); },
+            [Symbol.toPrimitive]() { return count; },
         };
 
-        // Cost-basis denominator: entry notional + entry commission.
-        // Notional = |size| × entry_price × pointValue (PV converts price-units
-        // to account currency for futures; 1 for crypto/forex).
-        // For closed trades, trade.commission already contains BOTH entry
-        // and exit legs, so we approximate the entry leg as half. (For the
-        // percent='percent' commission type both legs are roughly equal at
-        // entry vs exit price — close enough; matches TV within epsilon.)
         const pointValue: number = context.pine?.syminfo?.pointvalue ?? 1;
-        const costBasis = (t: Trade): number => {
-            const notional = Math.abs(t.size) * t.entry_price * pointValue;
-            const entryCommApprox = (t.commission ?? 0) / 2;
-            return notional + entryCommApprox;
-        };
+        const costBasis = (t: Trade): number => tradeCostBasis(t, pointValue);
 
-        result.profit = (i: any) => at(i)?.profit ?? NaN;
+        // Out of range: 0 for the numeric getters, na for prices, bar indexes and times, as on
+        // TradingView (like max_runup / max_drawdown below).
+        result.profit = (i: any) => at(i)?.profit ?? 0;
+        // The basis is signed: negative prices (back-adjusted futures) give a negative basis, which
+        // TradingView divides by (CL1! 1D: 2,270 on −31.11 × 1 × 1,000 → −7.2967 %).
         result.profit_percent = (i: any) => {
             const t = at(i);
-            if (!t || t.profit === undefined) return NaN;
+            if (!t) return 0;
+            if (t.profit === undefined) return NaN;
             const basis = costBasis(t);
-            return basis > 0 ? (100 * t.profit) / basis : NaN;
+            return basis !== 0 ? (100 * t.profit) / basis : NaN;
         };
-        result.size = (i: any) => at(i)?.size ?? NaN;
-        result.commission = (i: any) => at(i)?.commission ?? NaN;
+        result.size = (i: any) => at(i)?.size ?? 0;
+        result.commission = (i: any) => at(i)?.commission ?? 0;
         result.entry_price = (i: any) => at(i)?.entry_price ?? NaN;
         result.entry_bar_index = (i: any) => at(i)?.entry_bar_index ?? NaN;
         result.entry_id = (i: any) => at(i)?.entry_id ?? '';
@@ -87,9 +97,8 @@ export function closedtrades(context: any) {
             const basis = costBasis(t);
             return basis > 0 ? (100 * t.max_runup) / basis : 0;
         };
-        // v6 property: index of oldest still-listed trade. Always 0 unless we
-        // ever start trimming the buffer (we don't).
-        result.first_index = 0;
+        // v6 property: index of the oldest still-listed trade.
+        result.first_index = firstIndex;
 
         return result;
     };

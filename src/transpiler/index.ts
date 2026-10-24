@@ -64,25 +64,46 @@ import {
 } from './transformers/MainTransformer';
 import { extractPineScriptVersion, pineToJS } from './pineToJS/pineToJS.index';
 import { buildLtfSlices } from './slicing/buildLtfSlices';
+import { verifyClosedWorld } from './analysis/ClosedWorldVerifier';
 
 /**
  * Resolve the input into PineTS code plus the Pine Script version it came from.
  * `version` is null for PineTS-syntax / function input (no //@version marker):
  * such code is JavaScript-like and follows JS semantics, not a Pine version.
  */
-function getPineTSFromSource(source: string | Function): { code: string; version: number | null } {
+function getPineTSFromSource(
+    source: string | Function,
+    opts: { pineOnly?: boolean; libraries?: Record<string, string> } = {}
+): { code: string; version: number | null } {
     if (typeof source === 'function') {
         return { code: source.toString(), version: null };
     } else {
         const pineScriptVersion = extractPineScriptVersion(source);
         if (pineScriptVersion === null) {
+            // No `//@version` marker: the source is treated as PineTS syntax,
+            // which is JavaScript and runs as-is in the host realm. When
+            // `pineOnly` is set (untrusted third-party scripts), reject it —
+            // only Pine Script with a version marker, which goes through the
+            // closed-world verifier below, is accepted.
+            if (opts.pineOnly) {
+                throw new Error(
+                    'Pine Script version marker required: markerless source is treated as raw JavaScript and is rejected when pineOnly is set.'
+                );
+            }
             //assume it's PineTS syntax ==> use it as is
             return { code: source, version: null };
         }
         if (pineScriptVersion >= 5) {
             //assume it's Pine Script syntax ==> use pineToJS to transpile it
-            const pineToJSResult = pineToJS(source);
+            const pineToJSResult = pineToJS(source, { libraries: opts.libraries });
             if (pineToJSResult.success) {
+                const unresolved = pineToJSResult.unresolvedImports ?? [];
+                if (unresolved.length > 0) {
+                    throw new Error(
+                        `Unresolved Pine Script import${unresolved.length > 1 ? 's' : ''}: ${unresolved.map((s) => `"${s.path}"`).join(', ')}. ` +
+                            `Provide the library source with an import resolver (pineTS.setImportResolver) or the "libraries" transpile option.`
+                    );
+                }
                 return { code: pineToJSResult.code, version: pineScriptVersion };
             } else {
                 throw new Error(`Failed to transpile Pine Script version ${pineScriptVersion}: ${pineToJSResult.error}`);
@@ -93,7 +114,15 @@ function getPineTSFromSource(source: string | Function): { code: string; version
     }
 }
 
-export function transpile(source: string | Function, options: { debug: boolean; ln?: boolean } = { debug: false, ln: false }): Function {
+/**
+ * `libraries` maps the import paths (`user/library/version`) of the libraries a
+ * Pine Script source imports, its libraries' own imports included, to their
+ * sources. See `resolveImports` to collect them with an import resolver.
+ */
+export function transpile(
+    source: string | Function,
+    options: { debug: boolean; ln?: boolean; verify?: boolean; pineOnly?: boolean; libraries?: Record<string, string> } = { debug: false, ln: false }
+): Function {
     // Handle backward compatibility if a boolean is passed (though signature changed)
     if (typeof options === 'boolean') {
         options = { debug: options, ln: true };
@@ -101,7 +130,7 @@ export function transpile(source: string | Function, options: { debug: boolean; 
 
     const { debug } = options;
 
-    const { code: sourceCode, version: pineVersion } = getPineTSFromSource(source);
+    const { code: sourceCode, version: pineVersion } = getPineTSFromSource(source, { pineOnly: options.pineOnly, libraries: options.libraries });
     let code = sourceCode;
 
     // Pre-process: Wrap in context function if not already wrapped
@@ -228,6 +257,22 @@ export function transpile(source: string | Function, options: { debug: boolean; 
         generator: customGenerator,
         comments: debug,
     });
+
+    // Closed-world verification. Pine Script (version marker present) describes
+    // a closed world TradingView resolves against its built-ins; enforce the
+    // same on the GENERATED code — the exact string `new Function` compiles —
+    // so a script cannot reach host globals, the prototype chain, or PineTS
+    // runtime internals through it. Runs by default on the Pine path; set
+    // `verify: false` to opt out. PineTS-syntax / function input
+    // (pineVersion === null) is first-party JavaScript by contract and is not
+    // verified — gate untrusted strings with `pineOnly` instead.
+    if (options.verify !== false && pineVersion !== null) {
+        // Parse as a program: `transformedCode` is the arrow as an expression
+        // statement (astring emits a trailing `;`), so it parses on its own —
+        // wrapping it in parentheses would turn the `;` into a syntax error.
+        const verifyAst = acorn.parse(transformedCode, { ecmaVersion: 'latest' });
+        verifyClosedWorld(verifyAst);
+    }
 
     // Slice every `request.security_lower_tf` call site. Each slice is a
     // pre-built async Function whose body is the user-script prefix up

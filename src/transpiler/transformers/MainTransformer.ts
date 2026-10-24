@@ -178,7 +178,8 @@ const COMPARISON_METHODS: Record<string, string> = {
 const RELATIONAL_OPERATORS = new Set(['<', '<=', '>', '>=']);
 
 // Loop-control comparisons whose operands are integer counters (never `na`):
-// the `test`/`update` of for/while/do-while headers, and the generated loop
+// the `test`/`update` of for/while/do-while headers, a range loop's direction,
+// and the generated loop
 // guard (flagged `_skipCompare`). Routing these through the helpers would add
 // a per-iteration call for no benefit, so relational ops here stay native.
 // `==`/`!=` still transform everywhere (unchanged from prior behavior).
@@ -192,6 +193,10 @@ function isLoopControlRelational(node: any, ancestors: any[]): boolean {
         const anc = ancestors[k];
         const child = ancestors[k + 1];
         if (anc.type === 'ForStatement' && (child === anc.test || child === anc.update)) return true;
+        // The direction a range loop fixes at entry: `let i = start, __for_up0 = i <= end`.
+        if (anc.type === 'ForStatement' && child === anc.init) {
+            if (ancestors.slice(k + 1).some((a) => a.type === 'VariableDeclarator' && /^__for_up\d+$/.test(a.id?.name))) return true;
+        }
         if ((anc.type === 'WhileStatement' || anc.type === 'DoWhileStatement') && child === anc.test) return true;
     }
     return false;
@@ -480,7 +485,11 @@ export function runTransformationPass(
             }
 
             // Prepend guard check as the first statement in the loop body
-            if (node.body && node.body.type === 'BlockStatement') {
+            // (wrapping a braceless body first — PineTS-syntax only).
+            if (node.body) {
+                if (node.body.type !== 'BlockStatement') {
+                    node.body = { type: 'BlockStatement', body: [node.body] };
+                }
                 node.body.body.unshift(forOfGuard.guardCheck);
             }
 
@@ -512,9 +521,33 @@ export function runTransformationPass(
             } else if (node.right) {
                 c(node.right, state);
             }
+            // Inject loop guard (for-in is reachable only via PineTS-syntax input;
+            // native Pine `for…in` is emitted as a for-of). Without it an
+            // unbounded for-in could ignore setMaxLoops and hang the runtime.
+            const forInGuard = createLoopGuardNodes(state.getNextLoopGuardName());
+            state.addHoistedStatement(forInGuard.counterDecl);
             // Traverse the body
             if (node.body) {
                 c(node.body, state);
+                if (node.body.type !== 'BlockStatement') {
+                    node.body = { type: 'BlockStatement', body: [node.body] };
+                }
+                node.body.body.unshift(forInGuard.guardCheck);
+            }
+        },
+        DoWhileStatement(node: any, state: ScopeManager, c: any) {
+            // do…while is reachable only via PineTS-syntax input (native Pine has
+            // no do…while). Guard it so an unbounded do…while honors setMaxLoops
+            // instead of hanging the runtime.
+            const doGuard = createLoopGuardNodes(state.getNextLoopGuardName());
+            state.addHoistedStatement(doGuard.counterDecl);
+            if (node.test) c(node.test, state);
+            if (node.body) {
+                c(node.body, state);
+                if (node.body.type !== 'BlockStatement') {
+                    node.body = { type: 'BlockStatement', body: [node.body] };
+                }
+                node.body.body.unshift(doGuard.guardCheck);
             }
         },
         MemberExpression(node: any, state: ScopeManager, c: any) {
@@ -546,7 +579,7 @@ export function runTransformationPass(
             // `ReferenceError: <name> is not defined` at runtime.
             const traverseForIIFEs = (n: any): void => {
                 if (!n) return;
-                if (n.type === 'CallExpression' && n.callee &&
+                if (n.type === 'CallExpression' && n.callee && !n._iifeTransformed &&
                     (n.callee.type === 'ArrowFunctionExpression' || n.callee.type === 'FunctionExpression')) {
                     c(n.callee, state);
                 }

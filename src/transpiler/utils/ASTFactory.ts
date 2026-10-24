@@ -114,10 +114,11 @@ export const ASTFactory = {
         return this.createCallExpression(initMethod, args);
     },
 
-    createInitVarCall(targetVarRef: any, value: any): any {
-        // $.initVar(target, value)
+    createInitVarCall(targetVarRef: any, value: any, varip: boolean = false): any {
+        // $.initVar(target, value) — $.initVar(target, value, true) for `varip`
         const initMethod = this.createMemberExpression(this.createContextIdentifier(), this.createIdentifier('initVar'), false);
         const args = [targetVarRef, value];
+        if (varip) args.push(this.createLiteral(true));
         return this.createCallExpression(initMethod, args);
     },
 

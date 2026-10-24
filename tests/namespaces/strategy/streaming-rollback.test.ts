@@ -203,6 +203,48 @@ describe('Strategy - streaming ledger rollback', () => {
         90_000,
     );
 
+    it('varip keeps counting across the re-executions of the forming bar, var does not', async () => {
+        // Pine semantics (reference manual, `varip`): a varip variable is not rolled back between the
+        // realtime executions of a bar. History: bars 0-3 run once each (bar 3 is forming); each of the
+        // 3 ticks re-runs bar 3, then the new bar re-runs bar 3 with its final OHLC and runs bar 4.
+        const script = `
+//@version=6
+indicator('varip realtime')
+varip int execs = 0
+var int nbars = 0
+execs += 1
+nbars += 1
+plotchar(execs, "execs")
+plotchar(nbars, "nbars")
+`;
+        const provider = new ScriptedProvider([...HISTORY], tickSteps(3, 103.1, 104));
+        const pine = new PineTS(provider as any, 'FAKE', '1');
+        await pine.ready();
+        let full: any = null;
+        await new Promise<void>((resolve, reject) => {
+            const s = pine.stream(script, { interval: 1, pageSize: HISTORY.length });
+            s.on('error', (e: any) => reject(e));
+            s.on('data', (ctx: any) => {
+                full = ctx.fullContext ?? ctx;
+                // stop on the page of the 4th poll (the new bar): a further poll re-runs bar 4
+                if (provider.pollCount >= 4) {
+                    s.stop();
+                    resolve();
+                }
+            });
+            setTimeout(() => {
+                s.stop();
+                resolve();
+            }, 60_000);
+        });
+
+        // the streaming path appends a plot point per execution: keep each bar's last one
+        const lastPerBar = (key: string) => [...new Map(full.plots[key].data.map((d: any) => [d.time, d.value])).values()];
+        expect(lastPerBar('nbars')).toEqual([1, 2, 3, 4, 5]);
+        // bar 3: 4 history runs + 3 ticks + the final run; bar 4: one more
+        expect(lastPerBar('execs')).toEqual([1, 2, 3, 8, 9]);
+    }, 90_000);
+
     it('default pyramiding: an "enter when flat" breakout opens exactly one unit', async () => {
         // The breakout first triggers ON the forming bar, so the position is
         // flat during every re-execution — the pyramiding cap counts open

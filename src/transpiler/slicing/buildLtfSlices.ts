@@ -17,8 +17,8 @@
  *   - Phase 3 — call inside a user-defined function (or UDT method —
  *     methods compile to regular FunctionDeclarations). Slice
  *     preserves the function definition with its body truncated at
- *     the call, plus the EARLIEST top-level statement that invokes
- *     that function. Multi-level nesting (A→B→C with the call inside
+ *     the call, plus the top-level statements up to the LAST one that
+ *     invokes that function. Multi-level nesting (A→B→C with the call inside
  *     C, only B called from top level) is currently NOT handled
  *     specially; in that case the runtime falls back to today's
  *     full-script slow path.
@@ -194,16 +194,20 @@ function dollarCallTarget(node: any): string | null {
 }
 
 /**
- * Find the earliest top-level statement in `wrapperBody.body` whose
+ * Find the last top-level statement in `wrapperBody.body` whose
  * subtree contains a `$.call(<fnName>, ...)` invocation. Returns the
  * statement index, or -1 if no invocation is found.
+ *
+ * The slice is keyed by the static `pN`, but the runtime reads the value
+ * back under `<call-site id> + pN`, one name per call site. Every call
+ * site must therefore run in the secondary, not only the first one.
  *
  * Skips the function declaration itself (a fn calling itself wouldn't
  * count — and would put us in recursion territory).
  */
-function findEarliestInvocationIdx(wrapperBody: any, fnName: string, fnDeclNode: any): number {
+function findLastInvocationIdx(wrapperBody: any, fnName: string, fnDeclNode: any): number {
     const stmts: any[] = wrapperBody.body || [];
-    for (let i = 0; i < stmts.length; i++) {
+    for (let i = stmts.length - 1; i >= 0; i--) {
         const stmt = stmts[i];
         if (stmt === fnDeclNode) continue;
         if (subtreeContainsDollarCall(stmt, fnName)) return i;
@@ -243,7 +247,7 @@ function subtreeContainsDollarCall(root: any, fnName: string): boolean {
  *   1. The call's path = [wrapperBody, …, fnDecl, fnDecl.body, …, call].
  *   2. Slice fnDecl.body at the call (using sliceAlongPath rooted at
  *      fnDecl).
- *   3. Find the earliest top-level statement that invokes fnDecl via
+ *   3. Find the last top-level statement that invokes fnDecl via
  *      `$.call(fnDecl.id, …)`. If none, bail (defensive — shouldn't
  *      happen in practice).
  *   4. Build the wrapper-body slice: keep statements [0..invIdx]
@@ -283,8 +287,7 @@ function buildPhase3SliceStmts(wrapperBody: any, path: any[]): any[] | null {
     const fnSlicePath = path.slice(fnIdx); // [fnDecl, fnDecl.body?, …, call]
     const slicedFn = sliceAlongPath(fnNode, fnSlicePath, 0);
 
-    // Find the earliest top-level invocation of this function.
-    const invIdx = findEarliestInvocationIdx(wrapperBody, fnName, fnNode);
+    const invIdx = findLastInvocationIdx(wrapperBody, fnName, fnNode);
     if (invIdx < 0) return null;
 
     // Build the wrapper.body slice: keep [0..invIdx] inclusive, with

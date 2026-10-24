@@ -5,6 +5,7 @@ import { IProvider, ISymbolInfo } from './marketData/IProvider';
 import { PineArray } from './namespaces/array/array.index';
 import { PineMap } from './namespaces/map/map.index';
 import { PineMatrix } from './namespaces/matrix/matrix.index';
+import { PineMatrixObject } from './namespaces/matrix/PineMatrixObject';
 import { Barstate } from './namespaces/Barstate';
 import { Session } from './namespaces/Session';
 import { Core, NAHelper, AlertHelper } from './namespaces/Core';
@@ -35,8 +36,13 @@ import { VolumeRowHelper } from './namespaces/footprint/VolumeRowHelper';
 import { Ticker } from './namespaces/Ticker';
 import { isScalarHelper } from './namespaces/utils';
 import { receiverMatchesMethod } from './namespaces/methodDispatch';
+import { BUILTIN_METHOD_NAMES } from './transpiler/settings';
+import { PineRuntimeError } from './errors/PineRuntimeError';
+import type { IImportResolver } from './imports/IImportResolver';
 import type { IndicatorOptions } from './types/PineTypes';
 import { PineArrayObject, PineArrayType } from './namespaces/array/PineArrayObject';
+import { DRAWING_PARAMS } from './namespaces/drawingParams';
+import { withNamedArgs } from './namespaces/namedArgs';
 
 // Stand-in for an na drawing in getter / setter calls: getters return na (`get_text` and
 // `get_tooltip` the na string), setters and anything else do nothing.
@@ -78,6 +84,14 @@ export class Context {
 
     /** Alert mode: 'realtime' = only fire on live bars (TV behavior), 'all' = fire on every bar (backtest). */
     public _alertMode: 'realtime' | 'all' = 'realtime';
+
+    /** The strategy broker trades on the tick grid (see PineTS.setFillsOnTickGrid). */
+    public _fillsOnTickGrid: boolean = false;
+
+    /** Resolver of `import`ed libraries (see PineTS.setImportResolver), inherited by request.* secondary contexts. */
+    public importResolver: IImportResolver | null = null;
+    /** The current bar's raw prices while the broker works on its tick-grid copy. */
+    public _rawBar?: { open: number; high: number; low: number; close: number };
 
     /** Name-keyed map of declaration-prop overrides from `Indicator.prop`. Layered on top of
      *  the source's `indicator()`/`strategy()` call args inside the per-bar handlers
@@ -154,6 +168,9 @@ export class Context {
     public viewportRight: number | undefined = undefined;
 
     public pineTSCode: Function | String;
+    /** The transpiled function this context runs (what request.security
+     *  secondaries run when their call site has no slice). */
+    public transpiledFn: Function | null = null;
 
     public inputs: Record<string, any> = {};
 
@@ -197,6 +214,7 @@ export class Context {
 
             nz: core.nz.bind(core),
             indicator: core.indicator.bind(core),
+            library: core.library.bind(core),
             fixnan: core.fixnan.bind(core),
             alertcondition: core.alertcondition.bind(core),
             alert: new AlertHelper(this),
@@ -632,8 +650,13 @@ export class Context {
         if (root && !this.pine[root]) this.pine[root] = {};
 
         const target = root ? this.pine[root] : this.pine;
+        const named = DRAWING_PARAMS[root];
         for (const entry of entries) {
             if (typeof instance[entry] === 'function') {
+                // Drawing helpers take named arguments too. Wrapped on the helper itself, so the
+                // objects' method syntax (`l.set_extend(extend = …)` → `helper.set_extend(l, {…})`)
+                // gets them as well.
+                if (named && named[entry]) instance[entry] = withNamedArgs(instance[entry].bind(instance), named[entry]);
                 target[entry] = instance[entry].bind(instance);
             } else {
                 target[entry] = instance[entry];
@@ -723,9 +746,10 @@ export class Context {
      * - Subsequent bars: maintains the previous value (state).
      * @param trg - The target variable
      * @param src - The source initializer value
+     * @param varip - true for a `varip` declaration (exempt from the per-bar rollback)
      * @returns Series object
      */
-    initVar(trg, src: any): Series {
+    initVar(trg, src: any, varip: boolean = false): Series {
         // If target exists (subsequent bars), return it as is.
         // PineTS automatically shifts context variables by copying the last value,
         // so the previous value is already carried over to the current slot.
@@ -766,7 +790,9 @@ export class Context {
             value = this.precision(src);
         }
 
-        return this.typedSeries([value], value);
+        const series = this.typedSeries([value], value);
+        if (varip) series.varip = true;
+        return series;
     }
 
     /**
@@ -894,7 +920,13 @@ export class Context {
         // PineMapObject wraps a JS Map as `.map` — iterating yields [key, value]
         // pairs (Pine's `for v in map` semantics).
         if (source.map instanceof Map) return source.map;
+        if (source instanceof PineMatrixObject) return this._matrixRows(source);
         return source;
+    }
+
+    /** A matrix iterates its rows, each a copy as returned by `matrix.row()`. */
+    private _matrixRows(m: PineMatrixObject): PineArrayObject[] {
+        return m.matrix.map((_, i) => m.row(i));
     }
 
     /**
@@ -908,6 +940,7 @@ export class Context {
         if (source == null) return [].entries();
         if (Array.isArray(source.array)) return source.array.entries();
         if (source.map instanceof Map) return source.map.entries();
+        if (source instanceof PineMatrixObject) return this._matrixRows(source).entries();
         if (Array.isArray(source)) return source.entries();
         // Map / Set / other iterables that already yield tuples
         if (typeof source.entries === 'function') return source.entries();
@@ -982,6 +1015,16 @@ export class Context {
      * drawing itself, or for an na drawing a stand-in whose getters return na (`get_text` the
      * na string) and whose setters do nothing, as on TradingView.
      */
+    /**
+     * Halt the script with a loop-limit runtime error. The transpiler's loop
+     * guard calls this (`$.loopError(...)`) instead of `throw new Error(...)` so
+     * the fault is a `PineRuntimeError` — a host can tell a script-level loop-limit
+     * kill from a general engine error by `instanceof`, as the docs promise.
+     */
+    public loopError(message: string): never {
+        throw new PineRuntimeError(message);
+    }
+
     public drawingOrNa(receiver: any) {
         const isNa = receiver === null || receiver === undefined || (typeof receiver === 'number' && isNaN(receiver));
         return isNa ? NA_DRAWING : receiver;
@@ -1023,6 +1066,13 @@ export class Context {
             if (receiverMatchesMethod(fn, factory, recv)) return this.call(fn, id, receiver, ...args);
         }
 
+        // Fall back to a built-in object method, but only one Pine actually
+        // exposes. `name` is the method name from the script; looking it up
+        // directly on the receiver would also reach native JavaScript members
+        // (`"abc".length`, `arr.constructor`, `fn.apply`), which TradingView has
+        // no notion of — a parity break and a route off the Pine object graph.
+        // Restrict the lookup to the Pine built-in method vocabulary.
+        if (!BUILTIN_METHOD_NAMES.has(name)) return undefined;
         const member = recv[name];
         return typeof member === 'function' ? member.apply(recv, args.map(unwrap)) : undefined;
     }
