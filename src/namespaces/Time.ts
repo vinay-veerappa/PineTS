@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+import { tradingPeriodStart } from './tradingPeriod';
 import { Series } from '../Series';
 import { parseArgsForPineParams } from './utils';
 import { parseSessionSpec, isInSessionSpec } from './sessionSpec';
@@ -241,7 +242,14 @@ export class TimeHelper {
             // `time_close("60") - timenow` was always negative).
             const openTime = Series.from(this.context.data.openTime).get(barsBack);
             const bar = this._sessionBar(openTime, tf);
-            const start = bar ? bar.start : timeframeBarStart(openTime, tf);
+            // No session bar (W/M, or no session vocabulary): D/W/M follow the trading calendar —
+            // a CME week opens Sunday 17:00 CT, not Monday 00:00 UTC (upstream tradingPeriod).
+            const syminfo = this.context.pine?.syminfo;
+            const start = bar
+                ? bar.start
+                : tf.unit === 'D' || tf.unit === 'W' || tf.unit === 'M'
+                  ? tradingPeriodStart(openTime, tf, syminfo?.timezone || 'UTC', syminfo?.session)
+                  : timeframeBarStart(openTime, tf);
             htfBarTime = this.dataField === 'closeTime' ? (bar ? bar.end : timeframeBarEnd(start, tf)) : start;
             sessionCheckTime = start;
         }
