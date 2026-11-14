@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-const BINANCE_API_URL_DEFAULT = 'https://api.binance.com/api/v3';
+// api.binance.com answers HTTP 451 in some regions; the .vision mirror serves the same
+// market-data payloads without the geo restriction.
+const BINANCE_API_URL_DEFAULT = 'https://data-api.binance.vision/api/v3';
 const BINANCE_API_URL_US = 'https://api.binance.us/api/v3';
 const MAX_PAGINATION_REQUESTS = 200;
 const MAX_PAGINATION_BARS = 100_000;

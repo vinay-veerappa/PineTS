@@ -1,7 +1,7 @@
 import { PineTS } from 'PineTS.class';
 import { Context } from 'Context.class';
 
-const BINANCE_API_URL = 'https://api.binance.com/api/v3'; //'https://testnet.binance.vision/api/v3';
+const BINANCE_API_URL = 'https://data-api.binance.vision/api/v3'; // public market-data mirror: same payloads, no geo-block
 
 export async function getKlines(symbol: string, interval: string, limit?: number, startTime?: number, endTime?: number) {
     try {
